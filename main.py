@@ -647,7 +647,12 @@ def save_outputs(state: PipelineState) -> Path:
 
     try:
         docx_path = str(output_dir / "article.docx")
-        markdown_to_docx(article, docx_path, title=state.topic)
+        markdown_to_docx(
+            article, docx_path, title=state.topic,
+            meta_description=state.meta_description,
+            linkedin_post=state.linkedin_post,
+            twitter_post=state.twitter_post,
+        )
         console.print(f"  [green]DOCX exported:[/green] article.docx")
     except Exception as e:
         console.print(f"  [yellow]DOCX export failed: {e}[/yellow]")

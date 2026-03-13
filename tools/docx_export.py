@@ -9,10 +9,13 @@ from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 
-def markdown_to_docx(markdown_text: str, output_path: str, title: str = "") -> str:
+def markdown_to_docx(markdown_text: str, output_path: str, title: str = "",
+                     meta_description: str = "", linkedin_post: str = "",
+                     twitter_post: str = "") -> str:
     """
     Convert a markdown article to a DOCX file with proper heading hierarchy,
-    lists, tables, bold/italic, and links.
+    lists, tables, bold/italic, and links. Optionally appends social copy
+    (meta description, LinkedIn post, Twitter post) after the article.
 
     Returns the output file path.
     """
@@ -142,6 +145,40 @@ def markdown_to_docx(markdown_text: str, output_path: str, title: str = "") -> s
         p = doc.add_paragraph()
         _add_rich_text(p, stripped)
         i += 1
+
+    # ── Append social copy section if provided ──
+    if meta_description or linkedin_post or twitter_post:
+        # Separator
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(12)
+        p.paragraph_format.space_after = Pt(12)
+        run = p.add_run("_" * 50)
+        run.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)
+        run.font.size = Pt(8)
+
+        doc.add_heading("Social Copy & Meta Description", level=2)
+
+        if meta_description:
+            p = doc.add_paragraph()
+            run = p.add_run("Meta Description")
+            run.bold = True
+            p = doc.add_paragraph()
+            p.add_run(meta_description)
+
+        if linkedin_post:
+            p = doc.add_paragraph()
+            run = p.add_run("LinkedIn Post")
+            run.bold = True
+            for line in linkedin_post.split("\n"):
+                p = doc.add_paragraph()
+                p.add_run(line)
+
+        if twitter_post:
+            p = doc.add_paragraph()
+            run = p.add_run("X/Twitter Post")
+            run.bold = True
+            p = doc.add_paragraph()
+            p.add_run(twitter_post)
 
     # Save
     output = Path(output_path)

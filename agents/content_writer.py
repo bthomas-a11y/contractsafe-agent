@@ -17,35 +17,47 @@ class ContentWriterAgent(BaseAgent):
     emoji = "\u270d\ufe0f"
 
     def run(self, state: PipelineState) -> PipelineState:
-        # Load trimmed knowledge pack (1 North Star, no redundancy)
-        knowledge_pack = self._load_trimmed_knowledge()
+        # Load voice, style rules, and North Star voice excerpts
+        knowledge_pack = self._load_knowledge()
 
         # Trim citation map to just URL + anchor
         citation_summary = self._trim_citation_map(state.citation_map)
 
-        user_prompt = f"""Here is your content brief:
-{state.consolidated_brief}
+        user_prompt = f"""## VOICE IS THE #1 PRIORITY
+
+Before anything else: this article must sound like a smart friend explaining something over coffee. Every paragraph. Not just the intro. If a paragraph reads like a textbook or corporate blog, rewrite it until it sounds like conversation.
+
+Specific voice requirements:
+- Start the opening with a universal observation or analogy, NOT the topic. Keep the intro under 150 words.
+- State your chosen metaphor in one sentence before the article, then introduce it naturally in the opening and thread it through sections with brief callbacks. Do NOT front-load the metaphor as a mapping.
+- Every section needs personality: parenthetical asides, rhetorical questions, direct address ("you"), conversational bridges ("Here's the thing," "The part most people get wrong"), observations that feel like genuine realizations.
+- Tell at least one COMPLETE story (setup, context, buildup, payoff). Don't summarize stories.
+- No flat informational paragraphs. If you catch yourself writing "X is a document that does Y," stop and rewrite it as "X is basically Y (which is the key distinction, and the one that trips people up)."
 
 {knowledge_pack}
+
+## Content Brief
+{state.consolidated_brief}
 
 ## Citation Map (URL + anchor text only)
 {citation_summary}
 
-Write a {state.content_type} on the topic: {state.topic}
-**Word cap: {state.target_word_count} words maximum.** Shorter is fine if the topic is fully covered. Do not pad.
-
-Primary keyword: {state.target_keyword}
-Secondary keywords: {', '.join(state.secondary_keywords)}
+## Specifications
+- Content type: {state.content_type}
+- Topic: {state.topic}
+- **Word cap: {state.target_word_count} words maximum.** Shorter is fine if the topic is fully covered. Do not pad.
+- Primary keyword: {state.target_keyword}
+- Secondary keywords: {', '.join(state.secondary_keywords)}
 
 {f'Additional instructions from the user: {state.additional_instructions}' if state.additional_instructions else ''}
 
-Remember:
-- Choose your OWN extended metaphor (state it before the article)
-- Tell COMPLETE stories with narrative arcs
-- Meander and digress, take the scenic route
-- Same voice as casual conversation, no mode switching
-- Apply ALL style rules on this first draft (no em dashes, under 42 words per paragraph, curly quotes)
-- Integrate all links from the citation map naturally"""
+## Style Rules (apply on first draft)
+- No em dashes (use commas, periods, or restructure)
+- All paragraphs under 42 words
+- Curly quotes only
+- Integrate all links from the citation map naturally
+- Format bullet lists and numbered lists with each item on its own line
+- **Section ordering: The FAQ section must always be the LAST section of the article.** Any product/software CTA section goes before FAQs, not after."""
 
         self.progress("Writing article (this may take a minute)...")
         response = self.call_llm(CONTENT_WRITER_SYSTEM, user_prompt)
@@ -57,24 +69,21 @@ Remember:
         self.log(f"Draft complete: ~{word_count} words")
         return state
 
-    def _load_trimmed_knowledge(self) -> str:
-        """Load knowledge pack with only 1 North Star article (the shorter one)."""
+    def _load_knowledge(self) -> str:
+        """Load brand voice, style rules, and North Star voice excerpts.
+
+        The North Star article demonstrates the target voice. We extract KEY
+        excerpts that show patterns Claude wouldn't naturally produce:
+        - Metaphor callbacks at section openings
+        - Complete stories told fully
+        - Casual product integration with personality
+        - Short punchy sentences mixed with longer ones
+        """
         brand_voice = load_brand_voice()
         style_rules = load_style_rules()
 
-        # Pick the shorter North Star article
-        north_star_text = ""
-        if NORTH_STAR_DIR.exists():
-            articles = []
-            for f in sorted(NORTH_STAR_DIR.glob("*.md")):
-                content = f.read_text()
-                articles.append((f.stem, content, len(content)))
-
-            if articles:
-                # Sort by length, pick shortest
-                articles.sort(key=lambda x: x[2])
-                stem, content, _ = articles[0]
-                north_star_text = f"### NORTH STAR: {stem.replace('_', ' ').title()}\n\n{content}"
+        # Load North Star voice excerpts
+        voice_excerpts = self._extract_voice_excerpts()
 
         return f"""## BRAND VOICE GUIDE (MANDATORY)
 {brand_voice}
@@ -82,10 +91,59 @@ Remember:
 ## STYLE RULES (MANDATORY)
 {style_rules}
 
-## NORTH STAR ARTICLE (MANDATORY REFERENCE)
-Read this for HOW it thinks and writes, not WHAT it references.
+{voice_excerpts}"""
 
-{north_star_text or '[No North Star articles found]'}"""
+    def _extract_voice_excerpts(self) -> str:
+        """Extract voice-teaching excerpts from North Star articles.
+
+        These excerpts demonstrate patterns Claude wouldn't naturally produce.
+        We load selected passages, not the full article, to keep context focused.
+        """
+        if not NORTH_STAR_DIR.exists():
+            return ""
+
+        articles = list(NORTH_STAR_DIR.glob("*.md"))
+        if not articles:
+            return ""
+
+        # Read the first article
+        content = articles[0].read_text()
+
+        # Extract specific passages that demonstrate key voice patterns
+        excerpts = []
+
+        # 1. How the metaphor is introduced (casual, not announced)
+        excerpts.append("""PATTERN: Introducing the metaphor casually, not as a declaration
+"Think of it like planning a hike. This is that initial text you send to figure out which friend you can rope in to go with you."
+NOTE: The metaphor isn't announced ("My metaphor is hiking"). It's just used naturally.""")
+
+        # 2. How the metaphor is called back in each section
+        excerpts.append("""PATTERN: Brief metaphor callbacks at section openings (different angle each time)
+Section 2: "This is like talking over your hiking route with all your friends before you set off into the woods together."
+Section 3: "After wrangling your hiking buddies into an outdoor adventure and planning the details, you'll get their final approval on which trail you're taking and who's providing the snacks."
+Section 5: "The moment of truth comes once you've finished your hike. You'll likely be in your car with your friend, debriefing about the experience. Was the walk too steep? Was the scenery worth it?"
+NOTE: Each callback advances the metaphor's story, not just repeats it.""")
+
+        # 3. Complete story (George Lucas) — told fully, not summarized
+        excerpts.append("""PATTERN: Complete story with setup, buildup, and ironic payoff
+"Take, for example, the contract between 20th Century Fox and George Lucas over merchandising rights for Star Wars back in 1977. George Lucas said, 'Sure, I'll take a lower directors fee... if you give me all the licenses for the characters in the movie.' The studio execs happily agreed, laughing all the way to the bank. I mean, it's not like anyone would ever create an entire Disney theme park based on this Star Wars flick, right? Right?!"
+NOTE: The irony IS the payoff. The story is told, not summarized.""")
+
+        # 4. Casual product integration — personality, not feature list
+        excerpts.append("""PATTERN: Product mentions with personality (not feature lists)
+"That's a lot to write out from scratch every time! But luckily, you don't have to."
+"That way, your contract language will always stay consistent and rock-solid, and your business will be protected from a lot of unnecessary risks. (We can hear your lawyer breathing a sigh of relief!)"
+"Instead of emailing 'Agreement_version_2_update_5.docx' back and forth, everyone clicks straight into the same live version of the same document"
+NOTE: Specific scenarios ("Agreement_version_2_update_5.docx") beat abstract claims ("streamline collaboration").""")
+
+        # 5. Transitions that are conversational, not formal
+        excerpts.append("""PATTERN: Conversational transitions (not "Furthermore" or "Additionally")
+"But we'll be the first to admit this all sounds a little jargony, which is why we're breaking it down into human terms."
+"If this all sounds like a lot of work, well, that's what we're here to help with."
+"You can probably see where we're going with this."
+NOTE: These transitions feel like someone TALKING, not writing a paper.""")
+
+        return "## NORTH STAR VOICE EXAMPLES (MANDATORY REFERENCE)\n\nThese excerpts from a published ContractSafe article demonstrate the EXACT voice you must use. Study the patterns, not the topic.\n\n" + "\n\n".join(excerpts)
 
     def _trim_citation_map(self, citation_map: dict) -> str:
         """Trim citation map to just URL + anchor (no full metadata)."""
@@ -103,7 +161,7 @@ Read this for HOW it thinks and writes, not WHAT it references.
 
     def run_with_revisions(self, state: PipelineState, notes: str) -> PipelineState:
         """Re-run the writer with revision notes."""
-        knowledge_pack = self._load_trimmed_knowledge()
+        knowledge_pack = self._load_knowledge()
 
         user_prompt = f"""Here is the current draft:
 
@@ -115,7 +173,8 @@ The user provided these revision notes:
 {notes}
 
 Please revise the article to address this feedback. Maintain the same extended metaphor
-and voice. Return the complete revised article.
+and conversational voice throughout. Every paragraph should sound like you're explaining
+to a friend, not writing a textbook. Return the complete revised article.
 
 Remember all style rules: no em dashes, paragraphs under 42 words, curly quotes."""
 

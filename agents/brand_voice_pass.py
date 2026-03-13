@@ -48,12 +48,58 @@ def _normalize_markdown(article: str) -> str:
     This is a safety net that catches damage from any source — Claude's delta
     responses collapsing multi-line structures, or any other processing step.
     """
+    # Step 0: Rejoin lines broken mid-sentence BEFORE splitting lists
+    article = _rejoin_broken_continuations(article)
     article = _fix_single_line_tables(article)
     article = _fix_concatenated_bullets(article)
     article = _fix_concatenated_numbered_items(article)
     article = _fix_broken_links(article)
+    article = _merge_bullet_orphans(article)
     article = _strip_trailing_social_copy(article)
     return article
+
+
+def _rejoin_broken_continuations(text: str) -> str:
+    """Rejoin lines that were broken mid-sentence.
+
+    Detects when a line doesn't end with sentence-ending punctuation and the
+    next non-blank line starts with a lowercase word (indicating it was split
+    from the previous line). Joins them back so downstream list/link fixers
+    see complete text.
+    """
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        # Skip empty, structural, or very short lines
+        if (not stripped or stripped.startswith('#') or stripped == '---'
+                or stripped.startswith('|') or stripped.startswith('>')):
+            result.append(lines[i])
+            i += 1
+            continue
+
+        # Check if line doesn't end with sentence-ending punctuation
+        if stripped[-1] not in '.!?:':
+            # Look for continuation on next non-blank line
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+
+            if j < len(lines):
+                next_s = lines[j].strip()
+                # Continuation: starts with lowercase, isn't structural
+                if (next_s and next_s[0].islower()
+                        and not next_s.startswith('---')):
+                    # Join, skip blank lines in between
+                    result.append(stripped + ' ' + next_s)
+                    i = j + 1
+                    continue
+
+        result.append(lines[i])
+        i += 1
+    return '\n'.join(result)
 
 
 def _fix_single_line_tables(text: str) -> str:
@@ -97,48 +143,218 @@ def _fix_single_line_tables(text: str) -> str:
 def _fix_concatenated_bullets(text: str) -> str:
     """Split concatenated bullet items onto separate lines.
 
-    Detects patterns like '- item one - item two - item three' on a single line.
+    Handles two patterns:
+    1. '- item one - item two - item three' on a single line
+    2. '**Heading:** - item one - item two' (inline bullets after bold heading)
     """
     lines = text.split('\n')
     result = []
     for line in lines:
         stripped = line.strip()
-        # Must start with - and contain at least one more - mid-line
-        if not stripped.startswith('- ') or ' - ' not in stripped[2:]:
-            result.append(line)
-            continue
-        # Don't split inside markdown links [text - with dash](url)
-        # Temporarily protect link content
-        protected = re.sub(r'\[([^\]]+)\]', lambda m: m.group(0).replace(' - ', ' \x00 '), stripped)
-        if ' - ' not in protected[2:]:
-            result.append(line)
-            continue
-        # Split at ' - ' boundaries (keeping the - prefix)
-        parts = re.split(r'\s+(?=-\s)', protected)
-        for part in parts:
-            result.append(part.replace(' \x00 ', ' - '))
+
+        # Pattern 1: Line starts with '- ' and has more items
+        if stripped.startswith('- ') and ' - ' in stripped[2:]:
+            # Protect link content from splitting
+            protected = re.sub(r'\[([^\]]+)\]', lambda m: m.group(0).replace(' - ', ' \x00 '), stripped)
+            if ' - ' in protected[2:]:
+                parts = re.split(r'\s+(?=-\s)', protected)
+                for part in parts:
+                    result.append(part.replace(' \x00 ', ' - '))
+                continue
+
+        # Pattern 2: Line has inline bullets after other content (e.g., bold heading)
+        # Detect: text followed by ' - item - item' pattern
+        if not stripped.startswith('- ') and ' - ' in stripped:
+            # Protect link content
+            protected = re.sub(r'\[([^\]]+)\]', lambda m: m.group(0).replace(' - ', ' \x00 '), stripped)
+            # Find first ' - ' that starts a bullet list pattern
+            # Must have at least 2 ' - ' patterns to indicate a list
+            dash_positions = [m.start() for m in re.finditer(r' - \S', protected)]
+
+            if len(dash_positions) >= 2:
+                # Multiple dashes — clearly a concatenated list
+                first_dash = dash_positions[0]
+                heading = stripped[:first_dash].rstrip()
+                bullet_text = stripped[first_dash:].strip()
+                bullet_text = bullet_text.replace(' \x00 ', ' - ')
+                result.append(heading)
+                bullet_protected = re.sub(r'\[([^\]]+)\]', lambda m: m.group(0).replace(' - ', ' \x00 '), bullet_text)
+                parts = re.split(r'\s+(?=-\s)', bullet_protected)
+                for part in parts:
+                    result.append(part.replace(' \x00 ', ' - '))
+                continue
+
+            if len(dash_positions) == 1:
+                # Single dash — check if it's a bullet after end-of-sentence
+                # Pattern: "...sentence end. - **Bold text" or "...end. - Text"
+                dash_pos = dash_positions[0]
+                before = protected[:dash_pos].rstrip()
+                if before and before[-1] in '.!?':
+                    result.append(stripped[:dash_pos].rstrip())
+                    result.append(stripped[dash_pos:].strip())
+                    continue
+
+        result.append(line)
     return '\n'.join(result)
 
 
 def _fix_concatenated_numbered_items(text: str) -> str:
-    """Split concatenated numbered items onto separate lines.
+    """Reconstruct broken numbered lists onto one-item-per-line format.
 
-    Detects patterns like '1. item 2. item 3. item' on a single line.
+    Claude sometimes generates numbered lists as flowing prose that gets
+    broken across lines by downstream processing. This function:
+    1. Detects numbered list blocks (starting from '1.')
+    2. Collects all lines belonging to the block
+    3. Joins them into one string
+    4. Splits at sequential number boundaries (1., 2., 3., ...)
+    5. Outputs each item on its own line
     """
     lines = text.split('\n')
     result = []
-    for line in lines:
+    i = 0
+
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        # Only trigger on the start of a numbered list (must begin with "1.")
+        if not re.match(r'^1[\.\)]\s', stripped):
+            result.append(lines[i])
+            i += 1
+            continue
+
+        # Collect all lines belonging to this numbered list block
+        block_lines = [stripped]
+        j = i + 1
+
+        while j < len(lines):
+            s = lines[j].strip()
+
+            # Clear terminators: headings, horizontal rules, tables, bullets
+            if s.startswith('#') or s == '---':
+                break
+            if s.startswith('- ') or s.startswith('* '):
+                break
+            if s.startswith('|') and '|' in s[1:]:
+                break
+
+            # Blank line: check if list continues after it
+            if not s:
+                peek = j + 1
+                while peek < len(lines) and not lines[peek].strip():
+                    peek += 1
+                if peek >= len(lines):
+                    break
+                peek_s = lines[peek].strip()
+                has_nums = bool(re.search(r'(?:^|\s)\d+[\.\)]\s', peek_s))
+                prev_orphaned = bool(
+                    block_lines and re.search(r'(?:^|\s)\d+[\.\)]\s*$', block_lines[-1]))
+                if has_nums or prev_orphaned:
+                    j += 1
+                    continue
+                # Bold text after orphaned number
+                if re.match(r'^\*\*', peek_s) and prev_orphaned:
+                    j += 1
+                    continue
+                break
+
+            # Content line: check if it belongs to the list
+            has_nums = bool(re.search(r'(?:^|\s)\d+[\.\)]\s', s))
+            prev_orphaned = bool(
+                block_lines and re.search(r'(?:^|\s)\d+[\.\)]\s*$', block_lines[-1]))
+
+            if has_nums:
+                block_lines.append(s)
+                j += 1
+            elif prev_orphaned:
+                # Content for an orphaned number at end of previous line
+                block_lines.append(s)
+                j += 1
+            elif re.match(r'^\*\*', s) and prev_orphaned:
+                block_lines.append(s)
+                j += 1
+            elif re.match(r'^["\u201c]', s) and block_lines:
+                # Quoted text (e.g., example in a step) — include if in list context
+                block_lines.append(s)
+                j += 1
+            else:
+                break
+
+        # Join block into one string
+        block_text = ' '.join(block_lines)
+
+        # Find sequential number boundaries and split there
+        num_matches = list(re.finditer(r'(?:^|(?<=\s))(\d+)[\.\)]\s', block_text))
+        expected = 1
+        split_positions = []
+        for m in num_matches:
+            num = int(m.group(1))
+            if num == expected:
+                split_positions.append(m.start())
+                expected += 1
+
+        if split_positions:
+            for k, pos in enumerate(split_positions):
+                end = split_positions[k + 1] if k + 1 < len(split_positions) else len(block_text)
+                item = block_text[pos:end].strip()
+                if item:
+                    result.append(item)
+        else:
+            # Couldn't find sequential numbers — keep original lines
+            result.extend(block_lines)
+
+        i = j
+
+    return '\n'.join(result)
+
+
+def _merge_bullet_orphans(text: str) -> str:
+    """Merge standalone text lines sandwiched between bullet items into the previous bullet.
+
+    When a bullet item's text gets split across lines, the continuation can
+    appear as a standalone paragraph between two bullets. This breaks list
+    rendering in the DOCX. Detect and merge these orphans.
+    """
+    lines = text.split('\n')
+    result = []
+
+    for i, line in enumerate(lines):
         stripped = line.strip()
-        if not re.match(r'^\d+\.\s', stripped):
+
+        # Skip blank, structural, bullets, numbered items, and bold headings
+        if (not stripped or stripped.startswith('- ') or stripped.startswith('* ')
+                or stripped.startswith('#') or stripped == '---'
+                or stripped.startswith('|') or stripped.startswith('>')
+                or re.match(r'^\d+[\.\)]\s', stripped)
+                or stripped.startswith('**')):
             result.append(line)
             continue
-        # Check for multiple numbered items on same line
-        # Pattern: digit(s) followed by . and space, appearing 2+ times
-        items = re.split(r'\s+(?=\d+\.\s)', stripped)
-        if len(items) <= 1:
-            result.append(line)
+
+        # This is a non-structural text line. Check if it's between bullets.
+        prev_is_bullet = False
+        prev_idx = None
+        for k in range(len(result) - 1, -1, -1):
+            if result[k].strip():
+                if result[k].strip().startswith('- ') or result[k].strip().startswith('* '):
+                    prev_is_bullet = True
+                    prev_idx = k
+                break
+
+        next_is_bullet = False
+        for j in range(i + 1, min(i + 4, len(lines))):
+            ns = lines[j].strip()
+            if ns:
+                next_is_bullet = ns.startswith('- ') or ns.startswith('* ')
+                break
+
+        if prev_is_bullet and next_is_bullet and prev_idx is not None:
+            # Merge with previous bullet, removing any blank lines between
+            result[prev_idx] = result[prev_idx].rstrip() + ' ' + stripped
+            while len(result) > prev_idx + 1 and not result[-1].strip():
+                result.pop()
             continue
-        result.extend(items)
+
+        result.append(line)
+
     return '\n'.join(result)
 
 
@@ -306,7 +522,7 @@ def _split_long_paragraphs(article: str) -> str:
         if word_count <= 42:
             result.extend(current_para_lines)
         else:
-            # First pass: split at sentence boundaries
+            # Split at sentence boundaries only
             # Protect .!? inside markdown links [...] from triggering splits
             protected = re.sub(
                 r'\[([^\]]+)\]',
@@ -316,17 +532,12 @@ def _split_long_paragraphs(article: str) -> str:
             sentences = re.split(r'(?<=[.!?])\s+', protected)
             sentences = [s.replace('\x00', '.').replace('\x01', '!').replace('\x02', '?') for s in sentences]
             chunks = _chunk_by_limit(sentences, 42)
-            # Second pass: if any chunk is still >42 words, split at commas
-            final_chunks = []
-            for chunk_text in chunks:
-                if len(chunk_text.split()) > 42:
-                    parts = re.split(r',\s+', chunk_text)
-                    final_chunks.extend(_chunk_by_limit(parts, 42, rejoin=", "))
-                else:
-                    final_chunks.append(chunk_text)
-            for i, c in enumerate(final_chunks):
+            # If a single sentence is over 42 words, leave it intact.
+            # Splitting at commas creates broken fragments that look worse
+            # than a slightly long paragraph.
+            for i, c in enumerate(chunks):
                 result.append(c)
-                if i < len(final_chunks) - 1:
+                if i < len(chunks) - 1:
                     result.append("")  # blank line between splits
 
     for line in lines:
@@ -497,7 +708,59 @@ class BrandVoicePassAgent(BaseAgent):
             )
         report_lines.append(f"Link formatting issues: {len(link_issues)} types found")
 
-        # ── 8. Sentence variety check ──
+        # ── 8. Intro length check ──
+        # Intro is everything before the first H2 (excluding H1 and TL;DR)
+        intro_words = self._count_intro_words(article)
+        if intro_words > 200:
+            issues.append(
+                f"INTRO TOO LONG: {intro_words} words before first H2 (target: under 150). "
+                f"The opening should be 3-5 short paragraphs that set up the metaphor and bridge "
+                f"to the topic. Move detailed content into the body sections."
+            )
+        report_lines.append(f"Intro length: {intro_words} words (target: <150)")
+
+        # ── 9. Conversational markers (positive check) ──
+        conversational_markers = [
+            "here's the thing", "the part most people", "which brings us",
+            "and honestly", "but wait", "here's where", "here's what",
+            "the interesting part", "worth knowing", "the short version",
+            "look,", "the thing is", "turns out", "funny enough",
+            "not quite", "kind of", "sort of", "basically",
+            "the real question", "what most people", "nobody talks about",
+        ]
+        marker_count = sum(1 for m in conversational_markers if m in text_lower)
+        if marker_count < 3:
+            issues.append(
+                f"LOW CONVERSATIONAL MARKER DENSITY: Only {marker_count} conversational bridges "
+                f"found (target: 3+). Add phrases like 'Here's the thing,' 'The part most people "
+                f"get wrong,' 'Which brings us to,' 'And honestly,' etc. These make the voice "
+                f"feel like conversation, not a report."
+            )
+        report_lines.append(f"Conversational markers: {marker_count} found (target: 3+)")
+
+        # ── 10. Parenthetical asides (positive check) ──
+        paren_asides = re.findall(r'\([^)]{10,}[^)]*\)', article)
+        # Filter out markdown links and pure citations
+        paren_asides = [p for p in paren_asides if not p.startswith('(http') and '](http' not in p]
+        if len(paren_asides) < 2:
+            issues.append(
+                f"LOW PARENTHETICAL ASIDE COUNT: Only {len(paren_asides)} found (target: 2+). "
+                f"Parenthetical asides add personality. Examples: '(which is the key distinction, "
+                f"and the one that trips people up)', '(spoiler: it does)', '(cycle?)'."
+            )
+        report_lines.append(f"Parenthetical asides: {len(paren_asides)} found (target: 2+)")
+
+        # ── 11. Reader questions (positive check) ──
+        question_count = len(re.findall(r'[^#\|]\?', article))  # exclude heading ? and table ?
+        if question_count < 2:
+            issues.append(
+                f"LOW READER ENGAGEMENT: Only {question_count} questions to the reader (target: 2+). "
+                f"Ask the reader questions to create dialogue. Examples: 'Ever tried to...?', "
+                f"'Why does that matter?', 'What happens when...?'"
+            )
+        report_lines.append(f"Reader questions: {question_count} found (target: 2+)")
+
+        # ── 13. Sentence variety check ──
         sentences = []
         for line in lines:
             stripped = line.strip()
@@ -531,7 +794,7 @@ class BrandVoicePassAgent(BaseAgent):
         else:
             report_lines.append("Repetitive sentence starts: not enough sentences to check")
 
-        # ── 9. Passive voice density ──
+        # ── 14. Passive voice density ──
         passive_patterns = [
             r'\b(?:is|are|was|were|been|being)\s+(?:\w+ed|written|done|made|given|taken|found|known|seen|shown)\b',
         ]
@@ -548,15 +811,34 @@ class BrandVoicePassAgent(BaseAgent):
             )
         report_lines.append(f"Passive voice: ~{passive_count}/{total_sentences} sentences ({passive_pct:.0f}%, target: <20%)")
 
-        # ── 10. Exclamation mark overuse ──
+        # ── 15. Exclamation mark overuse ──
         exclamation_count = article.count("!")
-        if exclamation_count > 2:
+        if exclamation_count > 5:
             issues.append(
                 f"EXCLAMATION MARK OVERUSE: {exclamation_count} found. "
-                f"Use at most 1-2 in the entire article. The voice is calm and conversational, "
-                f"not enthusiastic or salesy."
+                f"Use at most 3-5 in the entire article. A few enthusiastic moments are "
+                f"fine, but too many feels salesy."
             )
-        report_lines.append(f"Exclamation marks: {exclamation_count} (target: 0-2)")
+        report_lines.append(f"Exclamation marks: {exclamation_count} (target: 0-5)")
 
         report = "\n".join(report_lines)
         return {"issues": issues, "report": report}
+
+    @staticmethod
+    def _count_intro_words(article: str) -> int:
+        """Count words in the intro (before the first H2, excluding H1 and TL;DR header)."""
+        lines = article.split("\n")
+        intro_words = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                break  # First H2 = end of intro
+            if stripped.startswith("# "):
+                continue  # Skip H1
+            if stripped.startswith("**TL;DR"):
+                continue  # Skip TL;DR header
+            if stripped.startswith("---"):
+                continue  # Skip horizontal rules
+            if stripped:
+                intro_words.extend(stripped.split())
+        return len(intro_words)
