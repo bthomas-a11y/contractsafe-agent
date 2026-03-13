@@ -1,10 +1,11 @@
 """Agent 7: Content Writer - writes the full article from the brief."""
 
-from agents.base import BaseAgent
-from agents.knowledge_loader import load_full_knowledge_pack
+import json
+from agents.base import BaseAgent, WRITER_TIMEOUT
+from agents.knowledge_loader import load_brand_voice, load_style_rules, load_north_star_articles
 from state import PipelineState
 from prompts.templates import CONTENT_WRITER_SYSTEM
-from config import WRITER_MODEL
+from config import WRITER_MODEL, NORTH_STAR_DIR
 
 
 class ContentWriterAgent(BaseAgent):
@@ -12,18 +13,26 @@ class ContentWriterAgent(BaseAgent):
     description = "Write the full article from the consolidated brief"
     agent_number = 7
     model = WRITER_MODEL
+    timeout = WRITER_TIMEOUT  # 5 min — writing a full article takes longer
     emoji = "\u270d\ufe0f"
 
     def run(self, state: PipelineState) -> PipelineState:
-        # Force-load ALL knowledge (brand voice + style rules + North Star articles)
-        knowledge_pack = load_full_knowledge_pack()
+        # Load trimmed knowledge pack (1 North Star, no redundancy)
+        knowledge_pack = self._load_trimmed_knowledge()
+
+        # Trim citation map to just URL + anchor
+        citation_summary = self._trim_citation_map(state.citation_map)
 
         user_prompt = f"""Here is your content brief:
 {state.consolidated_brief}
 
 {knowledge_pack}
 
-Write a {state.content_type} of approximately {state.target_word_count} words on the topic: {state.topic}
+## Citation Map (URL + anchor text only)
+{citation_summary}
+
+Write a {state.content_type} on the topic: {state.topic}
+**Word cap: {state.target_word_count} words maximum.** Shorter is fine if the topic is fully covered. Do not pad.
 
 Primary keyword: {state.target_keyword}
 Secondary keywords: {', '.join(state.secondary_keywords)}
@@ -48,9 +57,53 @@ Remember:
         self.log(f"Draft complete: ~{word_count} words")
         return state
 
+    def _load_trimmed_knowledge(self) -> str:
+        """Load knowledge pack with only 1 North Star article (the shorter one)."""
+        brand_voice = load_brand_voice()
+        style_rules = load_style_rules()
+
+        # Pick the shorter North Star article
+        north_star_text = ""
+        if NORTH_STAR_DIR.exists():
+            articles = []
+            for f in sorted(NORTH_STAR_DIR.glob("*.md")):
+                content = f.read_text()
+                articles.append((f.stem, content, len(content)))
+
+            if articles:
+                # Sort by length, pick shortest
+                articles.sort(key=lambda x: x[2])
+                stem, content, _ = articles[0]
+                north_star_text = f"### NORTH STAR: {stem.replace('_', ' ').title()}\n\n{content}"
+
+        return f"""## BRAND VOICE GUIDE (MANDATORY)
+{brand_voice}
+
+## STYLE RULES (MANDATORY)
+{style_rules}
+
+## NORTH STAR ARTICLE (MANDATORY REFERENCE)
+Read this for HOW it thinks and writes, not WHAT it references.
+
+{north_star_text or '[No North Star articles found]'}"""
+
+    def _trim_citation_map(self, citation_map: dict) -> str:
+        """Trim citation map to just URL + anchor (no full metadata)."""
+        if not citation_map:
+            return "No citation map available."
+        lines = []
+        for section, links in citation_map.items():
+            lines.append(f"\n### {section}")
+            for link in links:
+                url = link.get("url", "")
+                anchor = link.get("anchor", link.get("anchor_suggestion", ""))
+                link_type = link.get("type", "")
+                lines.append(f"- [{anchor}]({url}) ({link_type})")
+        return "\n".join(lines)
+
     def run_with_revisions(self, state: PipelineState, notes: str) -> PipelineState:
         """Re-run the writer with revision notes."""
-        knowledge_pack = load_full_knowledge_pack()
+        knowledge_pack = self._load_trimmed_knowledge()
 
         user_prompt = f"""Here is the current draft:
 
@@ -75,31 +128,45 @@ Remember all style rules: no em dashes, paragraphs under 42 words, curly quotes.
         return state
 
     def _parse_response(self, state: PipelineState, response: str):
-        """Parse the writer's response to extract metaphor and article."""
+        """Parse the writer's response to extract metaphor preamble and article.
+
+        Everything before the first H1 heading is preamble (metaphor framework).
+        Everything from the H1 onward is the article.
+        """
         lines = response.split("\n")
-        metaphor_lines = []
         article_start = 0
 
         for i, line in enumerate(lines):
-            lower = line.lower().strip()
-            if lower.startswith("# ") or lower.startswith("## "):
+            if line.strip().startswith("# ") and not line.strip().startswith("## "):
                 article_start = i
                 break
-            elif "metaphor" in lower or "mapping" in lower:
-                metaphor_lines.append(line)
-            elif metaphor_lines and line.strip():
-                metaphor_lines.append(line)
-            elif metaphor_lines and not line.strip():
-                article_start = i + 1
-                for j in range(i + 1, len(lines)):
-                    if lines[j].strip():
-                        article_start = j
-                        break
-                break
 
-        if metaphor_lines:
-            state.extended_metaphor = "\n".join(metaphor_lines)
-            state.draft_article = "\n".join(lines[article_start:])
+        if article_start > 0:
+            state.extended_metaphor = "\n".join(lines[:article_start]).strip()
+            state.draft_article = "\n".join(lines[article_start:]).strip()
         else:
             state.extended_metaphor = ""
-            state.draft_article = response
+            state.draft_article = response.strip()
+
+        # Strip trailing social copy that Claude sometimes appends unbidden
+        state.draft_article = self._strip_trailing_social(state.draft_article)
+
+    @staticmethod
+    def _strip_trailing_social(article: str) -> str:
+        """Remove social copy / meta description that Claude appends after the article."""
+        lines = article.split('\n')
+        social_markers = ['linkedin post', 'twitter post', 'x/twitter post',
+                          'meta description', 'seo meta', 'social post']
+        earliest_cut = None
+        for idx in range(len(lines) - 1, -1, -1):
+            if lines[idx].strip() == '---':
+                next_content = ''
+                for j in range(idx + 1, min(idx + 4, len(lines))):
+                    if lines[j].strip():
+                        next_content = lines[j].strip().lower()
+                        break
+                if any(marker in next_content for marker in social_markers):
+                    earliest_cut = idx
+        if earliest_cut is not None:
+            return '\n'.join(lines[:earliest_cut]).strip()
+        return article

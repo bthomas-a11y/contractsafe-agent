@@ -31,7 +31,9 @@ SEMRUSH_API_KEY = os.environ.get("SEMRUSH_API_KEY", "")
 
 # --- Model Configuration (used with claude CLI) ---
 RESEARCH_MODEL = "sonnet"
-WRITER_MODEL = "sonnet"
+WRITER_MODEL = "opus"        # Agents 7 (Content Writer) and 8 (Brand Voice) use Opus
+EDITING_MODEL = "sonnet"     # Agents 9-11 (Fact Check, SEO, AEO) use Sonnet
+HAIKU_MODEL = "haiku"        # Agent 12 (Social Copy) uses Haiku for speed
 
 # --- Paths ---
 PROJECT_ROOT = Path(__file__).parent
@@ -46,8 +48,7 @@ STYLE_RULES_FILE = KNOWLEDGE_DIR / "style_rules.md"
 
 # --- Claude CLI ---
 CLAUDE_CLI = "claude"
-CLAUDE_TIMEOUT = 600  # seconds per LLM call
-MAX_RETRIES = 3
+MAX_RETRIES = 2       # fail fast — 2 attempts, not 3
 RETRY_BASE_DELAY = 2  # seconds, exponential backoff
 
 # --- Web Fetch ---
