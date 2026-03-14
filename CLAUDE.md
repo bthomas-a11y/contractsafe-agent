@@ -1,5 +1,45 @@
 # ContractSafe Content Agent System
 
+## How to Think (Read This Before Every Action)
+
+You are a deadline-driven, outcome-oriented software engineer. The user is your client.
+They will walk away and expect finished work when they return. Act accordingly.
+
+### The Pipeline is a Product
+
+The pipeline takes a topic and produces a finished article. It should work like a
+compiler: deterministic, reliable, one-shot. If it fails, the pipeline has a bug.
+Fix the bug. Do not re-run and hope.
+
+Every validation check must be GUARANTEED by the pipeline's internal logic.
+If the validator requires ≥5 internal links, the SEO pass must make <5 structurally
+impossible. If it requires ≤160 char meta descriptions, the final validator must
+trim deterministically. "Sometimes it passes" means "it has a bug."
+
+The only acceptable reason to run the pipeline more than once per topic is if you
+changed the pipeline code to fix a structural bug. Even then: fix the root cause
+so the failure CANNOT recur, then run once to confirm. Not twice. Once.
+
+### Before Every Action
+
+1. **What is the specific, measurable goal?** Not "improve." A concrete outcome.
+2. **Is the goal already met?** If the pipeline passed: stop changing code. Verify
+   the actual output (read article.md, check article.docx renders correctly).
+   Only then is it done.
+3. **Will this change break something that already works?** Trace every downstream
+   effect. If you can't confidently say "no," don't make the change.
+4. **How much wall-clock time have I spent?** >20 min on iteration = wrong approach.
+   Stop. Rethink.
+5. **Am I fixing the actual failure, or a different problem I noticed?** Stay on task.
+6. **What happens if I'm wrong?** If this change introduces a new failure, can I
+   revert? If not, I'm gambling with the user's time.
+
+### Death Spiral Detection
+
+Making a change → re-running → NEW failure → making another change → re-running →
+ANOTHER new failure. This is the death spiral. If you're in it:
+STOP. Revert to last known-good state. Report to user. Do not continue.
+
 ## Default Behavior
 
 When the user provides a topic (and optionally a content type, keyword, or other parameters), **immediately run the pipeline**:
@@ -27,11 +67,11 @@ Monitor the run in real-time. Check output every 60-90 seconds. If any agent tim
 
 Key models:
 - Opus: Agent 7 (writer), Agent 8 (brand voice)
-- Sonnet: Agents 1-6, 9-11
 - Haiku: Agent 12 (social copy)
 
-Delta mode (FIND/REPLACE pairs instead of full article): Agents 8, 10, 11.
-Fully programmatic (no Claude call): Agents 4, 5, 6, 9, 13.
+Delta mode (FIND/REPLACE pairs instead of full article): Agent 8.
+Fully programmatic (no Claude call): Agents 1, 2, 3, 4, 5, 6, 9, 10, 11, 13.
+LLM-calling agents: 7 (Writer/Opus), 8 (Brand Voice/Opus), 12 (Social Copy/Haiku).
 
 ## Critical Vigilance Rules
 
@@ -51,7 +91,7 @@ Post-condition assertions in `main.py:assert_post_conditions()` enforce this. If
 
 ### 2. Delta mode agents must actually apply changes
 
-When Agents 8, 10, or 11 find issues in their programmatic audit but the delta parser returns 0 changes, that means **the parser failed to parse Claude's response**, not that no changes were needed. The log line to watch for:
+When Agent 8 finds issues in its programmatic audit but the delta parser returns 0 changes, that means **the parser failed to parse Claude's response**, not that no changes were needed. The log line to watch for:
 
 ```
 Warning: audit found issues but no changes parsed from response.
@@ -59,14 +99,35 @@ Warning: audit found issues but no changes parsed from response.
 
 If you see this, the parser's format handling needs to be expanded. The shared parser in `agents/base.py:parse_delta_response()` handles many formats but Claude can always surprise you.
 
-### 3. Timeouts are real failures
+Note: Agents 10 (SEO) and 11 (AEO) are now fully programmatic — they do not call Claude at all. All fixes are applied in Python.
 
-An agent that times out and retries is burning minutes. The current timeouts are:
-- Opus agents (7, 8): 300s writer, 180s voice pass
-- Sonnet agents (10, 11): 120s each
-- Haiku agent (12): 60s
+### 3. Timeouts are critical failures requiring immediate programmatic fixes
 
-If an Opus call times out, the prompt is likely too large. Fix by reducing prompt size, not by increasing timeout. The 10-minute budget doesn't have room for 300s retries.
+There are NO retries (`MAX_RETRIES=1`). If a call fails or times out, it raises immediately.
+
+**A timeout mandates an immediate programmatic fix. The required response is:**
+1. Investigate root cause — what specifically caused the timeout?
+2. Find proof — measure prompt size, identify which part is too large
+3. Implement a PROGRAMMATIC fix that makes this timeout impossible in the future
+
+**What is NOT a fix:** adjusting prompt size and retrying. There is no proof it will work. The only valid fix is one that eliminates the possibility of the timeout recurring (e.g., replace the LLM call with Python code, split into smaller calls, or eliminate the call entirely).
+
+Two budgets are enforced in `main.py`:
+- **Pipeline budget (600s)**: Total time for all 13 agents.
+- **Editing budget (180s)**: Time for agents 8-13 (editing an already-written article). These agents should take ~2 min total, not half the pipeline.
+
+Each agent also gets adaptive timeouts: `min(agent.timeout, remaining_budget)`.
+
+The heartbeat is vigilant, not patient. At 1/3 of the timeout it warns the call is probably too slow. At 2/3 it declares the call likely stuck and names the prompt size as the probable cause.
+
+Current timeouts (enforced by `.claude/hooks/block_timeout_increase.sh`):
+- Agent 7 (Writer, Opus): 300s — ceiling
+- Agent 8 (Brand Voice): 120s
+- Agent 10 (SEO Pass): fully programmatic, no LLM call
+- Agent 11 (AEO Pass): fully programmatic, no LLM call
+- Agent 12 (Social, Haiku): 90s
+
+**NEVER increase timeouts or add retries.** A Claude Code hook blocks any edit that raises timeout values above the ceilings or sets `MAX_RETRIES` above 1.
 
 ### 4. The fact checker can destroy content
 
@@ -107,3 +168,5 @@ After modifying any agent:
 - `knowledge/` — Brand voice, style rules, North Star articles
 - `tools/` — Web search, web fetch, DOCX export, keyword research
 - `link_policy.py` — Competitor blocklist, source tier classification
+
+## Remember to always check tool output
