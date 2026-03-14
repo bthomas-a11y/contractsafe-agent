@@ -1,6 +1,8 @@
-"""Agent 10: SEO Pass - runs programmatic SEO audit, then has Claude fix failures.
+"""Agent 10: SEO Pass - fully programmatic SEO audit and fixes.
 
-Uses delta mode: Claude returns find/replace pairs instead of the full article.
+Every issue is fixed in Python. No LLM call. If an issue can't be fixed
+programmatically, it's logged for manual review — not sent to Claude to
+burn 2 minutes on a 16k prompt.
 """
 
 from __future__ import annotations
@@ -8,64 +10,505 @@ from __future__ import annotations
 import re
 from agents.base import BaseAgent
 from state import PipelineState
-from prompts.templates import SEO_PASS_SYSTEM
 
 
 class SEOPassAgent(BaseAgent):
     name = "SEO Pass"
-    description = "Audit article for SEO issues and fix them"
+    description = "Audit article for SEO issues and fix them programmatically"
     agent_number = 10
     emoji = "\U0001f50e"
-    timeout = 120  # 2 min — delta mode is faster
+    timeout = 120  # 2 min — but should complete in <1s since it's fully programmatic
 
     def run(self, state: PipelineState) -> PipelineState:
         article = state.fact_check_article or state.voice_pass_article or state.draft_article
-        input_article = article
 
-        # ── Run programmatic SEO audit FIRST ──
-        self.progress("Running programmatic SEO audit...")
+        # ── Audit ──
+        self.progress("Auditing keyword density, links, and heading structure...")
         audit = self._audit(article, state)
         issues = audit["issues"]
-        report = audit["report"]
 
-        self.progress(f"Found {len(issues)} SEO issues to fix")
+        self.progress(f"Found {len(issues)} SEO issues")
         for issue in issues:
-            self.progress(f"  - {issue}")
+            self.progress(f"  - {issue[:100]}")
 
-        # ── Give Claude the specific issues to fix (delta mode) ──
-        issue_list = "\n".join(f"{i+1}. {issue}" for i, issue in enumerate(issues))
+        # ── Fix everything programmatically ──
+        self.progress("Inserting internal and external links programmatically...")
+        article, fixed = self._apply_all_fixes(article, issues, state)
 
-        user_prompt = f"""## ISSUES TO FIX
-{issue_list if issues else "No issues found."}
+        # ── Re-audit to see what remains ──
+        re_audit = self._audit(article, state)
+        remaining = re_audit["issues"]
 
-## SEO Parameters
-- Primary keyword: {state.target_keyword}
-- Secondary keywords: {', '.join(state.secondary_keywords) if state.secondary_keywords else 'None specified'}
+        if remaining:
+            self.log(f"[yellow]{len(remaining)} issues remain after programmatic fixes (logged, not sent to Claude):[/yellow]")
+            for issue in remaining:
+                self.log(f"  [yellow]- {issue[:100]}[/yellow]")
 
-## Available Links (use when adding links)
-Internal: {self._format_links(state.internal_links)}
-External: {self._format_links(state.external_links)}
-
-## ARTICLE
-===ARTICLE_START===
-{article}
-===ARTICLE_END==="""
-
-        self.progress("Having Claude fix identified issues (delta mode)...")
-        response = self.call_llm(SEO_PASS_SYSTEM, user_prompt)
-
-        # Parse and apply find/replace pairs (using shared parser from BaseAgent)
-        changes = self.parse_delta_response(response)
-        state.seo_pass_article = self.apply_delta_changes(input_article, changes)
-        state.seo_changes = [{"change": c["find"][:50], "reason": c["replace"][:50]} for c in changes]
-
-        if issues and not changes:
-            self.log(f"[yellow]Warning: {len(issues)} issues identified but no changes parsed from response.[/yellow]")
-
-        self.log(f"Audit found {len(issues)} issues. Applied {len(changes)} changes via delta mode.")
+        state.seo_pass_article = article
+        state.seo_changes = [{"change": f, "reason": "programmatic"} for f in fixed]
+        self.log(f"SEO pass complete. {len(fixed)} programmatic fixes. {len(remaining)} remaining (manual review).")
         return state
 
-    # ── Programmatic SEO audit ──
+    # ══════════════════════════════════════════════════════════════
+    # PROGRAMMATIC FIXES — one method per issue type
+    # ══════════════════════════════════════════════════════════════
+
+    def _apply_all_fixes(self, article: str, issues: list, state: PipelineState) -> tuple[str, list[str]]:
+        """Apply every possible programmatic fix. Returns (article, list_of_fix_names)."""
+        fixed = []
+        self._global_modified_lines = set()  # Track lines modified across all link-insertion calls
+
+        for issue in issues:
+            if "KEYWORD NOT IN ANY H2" in issue:
+                result = self._fix_keyword_in_h2(article, state.target_keyword)
+                if result:
+                    article = result
+                    fixed.append("keyword_in_h2")
+
+            elif "KEYWORD UNDERUSED" in issue:
+                result = self._fix_keyword_underuse(article, state.target_keyword)
+                if result:
+                    article = result
+                    fixed.append("keyword_density")
+
+            elif "KEYWORD MISSING FROM FIRST 100" in issue:
+                result = self._fix_keyword_in_intro(article, state.target_keyword)
+                if result:
+                    article = result
+                    fixed.append("keyword_in_intro")
+
+            elif "MISSING SECONDARY KEYWORDS" in issue:
+                result = self._fix_secondary_keywords(article, state.secondary_keywords)
+                if result:
+                    article = result
+                    fixed.append("secondary_keywords")
+
+            elif "INTERNAL LINKS" in issue and "ONLY" in issue:
+                result = self._fix_add_links(article, state.internal_links, "internal")
+                if result:
+                    article = result
+                    fixed.append("add_internal_links")
+
+            elif "EXTERNAL LINKS" in issue and "ONLY" in issue:
+                result = self._fix_add_links(article, state.external_links, "external")
+                if result:
+                    article = result
+                    fixed.append("add_external_links")
+
+            elif "LINKS NOT FRONT-LOADED" in issue:
+                result = self._fix_front_loading(article, state)
+                if result:
+                    article = result
+                    fixed.append("link_front_loading")
+
+            elif "NAKED URLs" in issue:
+                result = self._fix_naked_urls(article)
+                if result:
+                    article = result
+                    fixed.append("naked_urls")
+
+            elif "GENERIC ANCHOR TEXT" in issue:
+                result = self._fix_generic_anchors(article)
+                if result:
+                    article = result
+                    fixed.append("generic_anchors")
+
+        return article, fixed
+
+    def _fix_keyword_in_h2(self, article: str, keyword: str) -> str | None:
+        """Insert keyword into the most relevant H2 heading."""
+        h2s = re.findall(r"^(## .+)$", article, re.MULTILINE)
+        if not h2s:
+            return None
+
+        kw_lower = keyword.lower()
+        kw_words = set(kw_lower.split())
+
+        # Check if any H2 already contains keyword
+        for h2 in h2s:
+            if kw_lower in h2.lower():
+                return None
+
+        # Find H2 with most keyword-word overlap
+        best_h2 = None
+        best_overlap = 0
+        for h2 in h2s:
+            h2_words = set(h2.lower().split())
+            overlap = len(kw_words & h2_words)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_h2 = h2
+
+        if not best_h2:
+            best_h2 = h2s[0]
+
+        h2_text = best_h2[3:].strip()
+        kw_title = keyword.title() if keyword == keyword.lower() else keyword
+
+        if len(keyword.split()) <= 3:
+            new_h2 = f"## {kw_title}: {h2_text}"
+        else:
+            new_h2 = f"## {h2_text} ({kw_title})"
+
+        return article.replace(best_h2, new_h2, 1)
+
+    def _fix_keyword_underuse(self, article: str, keyword: str) -> str | None:
+        """Add keyword naturally to topically relevant body paragraphs."""
+        kw_lower = keyword.lower()
+        current_count = article.lower().count(kw_lower)
+        kw_word_count = len(keyword.split())
+
+        target = 2 if kw_word_count >= 4 else max(3, len(article.split()) // 500)
+        if current_count >= target:
+            return None
+
+        needed = target - current_count
+        lines = article.split("\n")
+        modified = False
+        topic_words = set(kw_lower.split())
+
+        for i, line in enumerate(lines):
+            if needed <= 0:
+                break
+            stripped = line.strip()
+            if (not stripped or stripped.startswith("#") or stripped.startswith("|")
+                    or stripped.startswith("-") or len(stripped) < 50
+                    or kw_lower in stripped.lower()
+                    or ("[" in stripped and "](" in stripped)):
+                continue
+
+            line_words = set(stripped.lower().split())
+            if not (topic_words & line_words):
+                continue
+
+            if stripped.endswith("."):
+                new_line = stripped[:-1] + f", a key aspect of {keyword}."
+                lines[i] = line.replace(stripped, new_line)
+                needed -= 1
+                modified = True
+
+        return "\n".join(lines) if modified else None
+
+    def _fix_keyword_in_intro(self, article: str, keyword: str) -> str | None:
+        """Add keyword to the first paragraph if missing from first 100 words."""
+        kw_lower = keyword.lower()
+        lines = article.split("\n")
+
+        # Find first body paragraph (not heading, not empty)
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and len(stripped) > 30:
+                if kw_lower not in stripped.lower():
+                    # Append keyword mention to first paragraph
+                    if stripped.endswith("."):
+                        new_line = stripped[:-1] + f", particularly when it comes to {keyword}."
+                        lines[i] = line.replace(stripped, new_line)
+                        return "\n".join(lines)
+                break
+        return None
+
+    def _fix_secondary_keywords(self, article: str, secondary_kws: list[str]) -> str | None:
+        """Add missing secondary keywords to relevant paragraphs."""
+        if not secondary_kws:
+            return None
+
+        lines = article.split("\n")
+        modified = False
+
+        for sk in secondary_kws:
+            if sk.lower() in article.lower():
+                continue
+
+            # Find a relevant paragraph to insert into
+            sk_words = set(sk.lower().split())
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if (not stripped or stripped.startswith("#") or stripped.startswith("|")
+                        or len(stripped) < 40 or sk.lower() in stripped.lower()
+                        or ("[" in stripped and "](" in stripped)):
+                    continue
+
+                line_words = set(stripped.lower().split())
+                if sk_words & line_words and stripped.endswith("."):
+                    new_line = stripped[:-1] + f" (including {sk})."
+                    lines[i] = line.replace(stripped, new_line)
+                    modified = True
+                    break
+
+        return "\n".join(lines) if modified else None
+
+    def _fix_add_links(self, article: str, available_links: list[dict], link_type: str) -> str | None:
+        """Add links from the available pool to topically relevant sentences."""
+        from link_policy import is_blocked
+
+        if not available_links:
+            return None
+
+        # Find which URLs are already in the article
+        existing_urls = set(u.lower() for _, u in re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', article))
+
+        # Get unused available links, filtering out blocked competitors
+        unused = [
+            l for l in available_links
+            if l.get("url", "").lower() not in existing_urls
+            and not is_blocked(l.get("url", ""))
+        ]
+        if not unused:
+            return None
+
+        lines = article.split("\n")
+        modified = False
+        added = 0
+
+        for link in unused[:7]:  # try up to 7 to meet minimum of 5
+            url = link.get("url", "")
+            anchor = link.get("anchor_suggestion", "") or link.get("anchor", "")
+            if not url or not anchor:
+                continue
+
+            # Use anchor + title words for broader matching
+            title = link.get("title", "")
+            match_text = f"{anchor} {title}".lower()
+            stopwords = {"the", "a", "an", "of", "for", "and", "in", "to", "with", "is", "on", "by", "at", "how", "why", "what"}
+            anchor_words = set(match_text.split()) - stopwords
+
+            # Try with 2+ word overlap first, then fall back to 1
+            placed = False
+            for min_overlap in (2, 1):
+                if placed:
+                    break
+                for i, line in enumerate(lines):
+                    if i in self._global_modified_lines:
+                        continue  # already had a link added by any fix call
+                    stripped = line.strip()
+                    link_count = stripped.count("](")
+                    if (not stripped or stripped.startswith("#") or stripped.startswith("|")
+                            or stripped.startswith("- ") or stripped.startswith("* ")
+                            or re.match(r'^\d+[\.\)]\s', stripped)
+                            or len(stripped) < 40 or url.lower() in line.lower()
+                            or link_count >= 2):
+                        continue
+
+                    line_words = set(stripped.lower().split())
+                    overlap = anchor_words & line_words
+                    if len(overlap) >= min_overlap and stripped.endswith("."):
+                        new_line = self._insert_link_naturally(stripped, anchor, url)
+                        if new_line is None:
+                            continue  # would exceed 42 words
+                        lines[i] = line.replace(stripped, new_line)
+                        modified = True
+                        added += 1
+                        self._global_modified_lines.add(i)
+                        placed = True
+                        break
+
+        return "\n".join(lines) if modified else None
+
+    def _insert_link_naturally(self, sentence: str, anchor: str, url: str) -> str | None:
+        """Insert a link by wrapping the best matching keyword span in the sentence.
+
+        Path 1: Exact anchor text found in sentence → wrap it.
+        Path 2: Find longest contiguous 2-4 word span matching anchor topic words → wrap it.
+        Path 3: No match → return None (caller tries next sentence).
+
+        Returns None if no suitable insertion point or result exceeds 42 words.
+        """
+        anchor_lower = anchor.lower()
+        sentence_lower = sentence.lower()
+
+        # Path 1: Exact anchor text in sentence — best case
+        if anchor_lower in sentence_lower:
+            idx = sentence_lower.index(anchor_lower)
+            # Don't wrap if already inside a markdown link
+            before = sentence[:idx]
+            if before.count('[') > before.count(']'):
+                return None
+            original = sentence[idx:idx + len(anchor)]
+            result = sentence[:idx] + f"[{original}]({url})" + sentence[idx + len(anchor):]
+            if len(result.split()) > 42:
+                return None
+            return result
+
+        # Path 2: Find the best multi-word span matching anchor topic words
+        stopwords = {
+            "the", "a", "an", "of", "for", "and", "in", "to", "with",
+            "is", "on", "by", "at", "how", "why", "what", "are", "this",
+            "that", "your", "their", "its", "can", "may", "will", "has",
+        }
+        anchor_words = set(anchor_lower.split()) - stopwords
+
+        if not anchor_words:
+            return None
+
+        words = sentence.split()
+        best_span = None
+        best_score = 0
+
+        for span_len in range(4, 1, -1):  # prefer longer spans
+            for start in range(len(words) - span_len + 1):
+                span = words[start:start + span_len]
+                span_text = " ".join(span)
+
+                # Skip if span is inside an existing markdown link
+                prefix_text = " ".join(words[:start])
+                if prefix_text.count('[') > prefix_text.count(']'):
+                    continue
+                if '[' in span_text or '](' in span_text:
+                    continue
+
+                span_lower_words = set(w.lower().strip('.,;:!?') for w in span)
+                matches = span_lower_words & anchor_words
+                if len(matches) >= 2 and len(matches) > best_score:
+                    best_score = len(matches)
+                    best_span = (start, start + span_len)
+
+        if best_span is None:
+            return None
+
+        start_idx, end_idx = best_span
+        matched = " ".join(words[start_idx:end_idx])
+        before_words = " ".join(words[:start_idx])
+        after_words = " ".join(words[end_idx:])
+
+        parts = []
+        if before_words:
+            parts.append(before_words)
+        parts.append(f"[{matched}]({url})")
+        if after_words:
+            parts.append(after_words)
+
+        result = " ".join(parts)
+        if len(result.split()) > 42:
+            return None
+        return result
+
+    def _fix_front_loading(self, article: str, state: PipelineState) -> str | None:
+        """Improve link front-loading by adding unused links to the first third.
+
+        Strategy: find available links not yet in the article, then add them
+        to topically relevant sentences in the first third of the article.
+        This doesn't move existing links (which would damage the writer's intent),
+        it adds new ones where they naturally fit.
+        """
+        words = article.split()
+        word_count = len(words)
+        first_third_end = word_count // 3
+
+        all_links = re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', article)
+        total_links = len(all_links)
+        if total_links == 0:
+            return None
+
+        first_third_text = " ".join(words[:first_third_end])
+        links_in_first_third = len(re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', first_third_text))
+        front_pct = links_in_first_third / total_links * 100
+
+        if front_pct >= 50:
+            return None  # Close enough
+
+        # Find unused available links (filter competitors)
+        from link_policy import is_blocked
+        existing_urls = set(u.lower() for _, u in all_links)
+        all_available = (state.internal_links or []) + (state.external_links or [])
+        unused = [
+            l for l in all_available
+            if l.get("url", "").lower() not in existing_urls
+            and not is_blocked(l.get("url", ""))
+        ]
+
+        if not unused:
+            # No unused links to add. Accept the current distribution.
+            return None
+
+        # Find the line number boundary for the first third
+        lines = article.split("\n")
+        char_count = 0
+        first_third_line_end = len(lines)
+        target_chars = len(" ".join(words[:first_third_end]))
+        for idx, line in enumerate(lines):
+            char_count += len(line) + 1
+            if char_count >= target_chars:
+                first_third_line_end = idx
+                break
+
+        modified = False
+        added = 0
+        needed = max(1, int(total_links * 0.6) - links_in_first_third)  # how many to add to reach ~60%
+
+        for link in unused[:needed + 1]:
+            url = link.get("url", "")
+            anchor = link.get("anchor_suggestion", "") or link.get("anchor", "")
+            if not url or not anchor:
+                continue
+
+            anchor_words = set(anchor.lower().split()) - {"the", "a", "an", "of", "for", "and", "in", "to", "with", "is", "on", "by", "at"}
+
+            # Only look at first third of article
+            for i in range(min(first_third_line_end, len(lines))):
+                if i in self._global_modified_lines:
+                    continue
+                line = lines[i]
+                stripped = line.strip()
+                if (not stripped or stripped.startswith("#") or stripped.startswith("|")
+                        or stripped.startswith("- ") or stripped.startswith("* ")
+                        or re.match(r'^\d+[\.\)]\s', stripped)
+                        or len(stripped) < 40 or url.lower() in line.lower()
+                        or "](" in stripped):  # skip lines with existing markdown links
+                    continue
+
+                line_words = set(stripped.lower().split())
+                if len(anchor_words & line_words) >= 1 and stripped.endswith("."):
+                    new_line = self._insert_link_naturally(stripped, anchor, url)
+                    if new_line is None:
+                        continue  # would exceed 42 words
+                    lines[i] = line.replace(stripped, new_line)
+                    self._global_modified_lines.add(i)
+                    modified = True
+                    added += 1
+                    break
+
+            if added >= needed:
+                break
+
+        return "\n".join(lines) if modified else None
+
+    def _fix_naked_urls(self, article: str) -> str | None:
+        """Convert naked URLs to markdown links."""
+        # Find URLs not already in markdown link format
+        naked = re.findall(r'(?<!\()(https?://\S+)(?!\))', article)
+        naked = [u for u in naked if f"]({u}" not in article]
+
+        if not naked:
+            return None
+
+        modified = article
+        for url in naked:
+            # Extract domain as anchor text
+            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
+            modified = modified.replace(url, f"[{domain}]({url})", 1)
+
+        return modified if modified != article else None
+
+    def _fix_generic_anchors(self, article: str) -> str | None:
+        """Replace generic anchor text like 'click here' with the URL domain."""
+        generic_pattern = r'\[(click here|learn more|read more|check out|here)\]\((https?://[^)]+)\)'
+        matches = list(re.finditer(generic_pattern, article, re.IGNORECASE))
+
+        if not matches:
+            return None
+
+        modified = article
+        for match in reversed(matches):  # reverse to preserve positions
+            url = match.group(2)
+            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
+            replacement = f"[{domain}]({url})"
+            modified = modified[:match.start()] + replacement + modified[match.end():]
+
+        return modified if modified != article else None
+
+    # ══════════════════════════════════════════════════════════════
+    # AUDIT — detects issues (unchanged from before)
+    # ══════════════════════════════════════════════════════════════
 
     def _audit(self, article: str, state: PipelineState) -> dict:
         """Run concrete, measurable SEO checks in Python."""
@@ -99,7 +542,6 @@ External: {self._format_links(state.external_links)}
         # ── 4. Keyword density (scaled by keyword length) ──
         kw_count = text_lower.count(kw)
         kw_word_count = len(kw.split())
-        # Long keywords (4+ words) need fewer occurrences to avoid sounding forced
         if kw_word_count >= 4:
             ideal_min = 2
             ideal_max = max(4, word_count // 500)
@@ -173,19 +615,9 @@ External: {self._format_links(state.external_links)}
         if h4s and not h3s:
             issues.append("HEADING HIERARCHY: H4 headings found without H3s. Don't skip heading levels.")
 
-        # ── 11. Word count (report only — not sent to Claude as an issue) ──
-        # Word count is the writer's job, not the SEO editor's. Asking Claude to
-        # cut/add 40% of an article via find/replace pairs causes timeouts.
+        # ── 11. Word count (report only) ──
         target = state.target_word_count
         report_lines.append(f"Word count: {word_count} (target: {target})")
 
         report = "\n".join(report_lines)
         return {"issues": issues, "report": report}
-
-    def _format_links(self, links: list[dict]) -> str:
-        if not links:
-            return "None available."
-        return "\n".join(
-            f"- {l.get('url', '')} | anchor: \"{l.get('anchor_suggestion', '')}\""
-            for l in links[:15]
-        )
