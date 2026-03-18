@@ -19,7 +19,7 @@ PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from tools.hubspot_cms import create_blog_draft, get_blog_post, list_blogs
+from tools.hubspot_cms import clone_and_replace, create_blog_draft, get_blog_post, list_blogs
 
 SERVER_NAME = "hubspot-cms"
 SERVER_VERSION = "1.0.0"

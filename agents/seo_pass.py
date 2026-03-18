@@ -68,7 +68,10 @@ class SEOPassAgent(BaseAgent):
         internal_before = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', article))
         external_before = len(re.findall(r'\[.*?\]\(https?://[^)]+\)', article)) - internal_before
 
-        for issue in issues:
+        # Process link insertion FIRST (before keyword destuffing, which removes anchor points)
+        link_issues = [i for i in issues if ("INTERNAL LINKS" in i or "EXTERNAL LINKS" in i) and "ONLY" in i]
+        other_issues = [i for i in issues if i not in link_issues]
+        for issue in link_issues + other_issues:
             if "KEYWORD NOT IN ANY H2" in issue:
                 result = self._fix_keyword_in_h2(article, state.target_keyword)
                 if result:

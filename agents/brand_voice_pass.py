@@ -458,31 +458,21 @@ def apply_mechanical_fixes(article: str) -> str:
     # ── 2c. Remove empty parentheses left by citation removal ──
     article = re.sub(r'\s*\(\s*\)', '', article)
 
-    # ── 3. Straight quotes → curly quotes ──
-    article = _curl_quotes(article)
-
-    # ── 3b. Close unmatched curly double quotes ──
-    # If the writer produced `"word.` without a closing `"`, _curl_quotes
-    # converts it to `\u201cword.` — an opening quote that never closes.
-    # Fix: on each line, if opening count > closing count, insert a closing
-    # quote before the first sentence-end punctuation after the last opener.
-    fixed_quote_lines = []
-    for qline in article.split("\n"):
-        opens = qline.count("\u201c")
-        closes = qline.count("\u201d")
-        if opens > closes:
-            # Find the last unmatched opener and close it at the next punctuation
-            last_open = qline.rfind("\u201c")
-            # Search for sentence-ending punctuation after the opener
-            for ci in range(last_open + 1, len(qline)):
-                if qline[ci] in '.!?':
-                    qline = qline[:ci] + "\u201d" + qline[ci:]
-                    break
-            else:
-                # No punctuation found — close at end of line
-                qline = qline.rstrip() + "\u201d"
-        fixed_quote_lines.append(qline)
-    article = "\n".join(fixed_quote_lines)
+    # ── 3. Normalize Unicode to ASCII ──
+    # Fix literal \uXXXX escape sequences the LLM sometimes outputs
+    article = re.sub(
+        r'\\u([0-9a-fA-F]{4})',
+        lambda m: chr(int(m.group(1), 16)),
+        article,
+    )
+    # Replace curly/smart quotes with straight equivalents
+    article = article.replace('\u2018', "'")   # left single quote
+    article = article.replace('\u2019', "'")   # right single quote / apostrophe
+    article = article.replace('\u201c', '"')   # left double quote
+    article = article.replace('\u201d', '"')   # right double quote
+    article = article.replace('\u2713', '*')   # checkmark → asterisk
+    article = article.replace('\u2026', '...')  # ellipsis
+    article = article.replace('\u00a0', ' ')   # non-breaking space
 
     # ── 3c. Close unmatched parentheses ──
     # Writer sometimes produces "(text without closing paren."
@@ -543,7 +533,7 @@ def apply_mechanical_fixes(article: str) -> str:
     article = article.replace(':. ', ': ')
     article = article.replace(':.\n', ':\n')
     # ".." → double period (from content insertion/removal)
-    article = re.sub(r'\.\.(?!\.)' , '.', article)  # ".." → "." but not "..."
+    article = re.sub(r'(?<!\.)\.\.(?!\.)' , '.', article)  # ".." → "." but not "..."
     # "?.\n" or "!.\n" → remove trailing period after question/exclamation
     article = re.sub(r'([?!])\.\s', r'\1 ', article)
     # ". But." → sentence fragment from content removal (". But [removed stat]. That's")
@@ -858,7 +848,7 @@ def _split_long_paragraphs(article: str) -> str:
                 lambda m: m.group(0).replace('.', '\x03'),
                 protected
             )
-            sentences = re.split(r'(?<=[.!?])[)\]"\'"\u201d\u2019]*\s+', protected)
+            sentences = re.split(r'(?<=[.!?])[)\]"\'"\u201d\u2019*]*\s+', protected)
             sentences = [s.replace('\x00', '.').replace('\x01', '!').replace('\x02', '?').replace('\x03', '.') for s in sentences]
             chunks = _chunk_by_limit(sentences, 42)
             # If a chunk is still over 42 words (single long sentence),
@@ -868,7 +858,15 @@ def _split_long_paragraphs(article: str) -> str:
                 if len(c.split()) > 42 and re.search(r'[:;]', c):
                     parts = re.split(r'(?<=[:;])\s+', c, maxsplit=1)
                     if len(parts) == 2 and all(len(p.split()) >= 5 for p in parts):
-                        # Capitalize after the split point
+                        parts[1] = parts[1][0].upper() + parts[1][1:]
+                        final_chunks.extend(parts)
+                    else:
+                        final_chunks.append(c)
+                # Fallback: split at comma + coordinating conjunction
+                elif len(c.split()) > 42 and re.search(r',\s+(?:and|but|or|so|yet)\s+', c):
+                    parts = re.split(r',\s+(?=(?:and|but|or|so|yet)\s+)', c, maxsplit=1)
+                    if len(parts) == 2 and all(len(p.split()) >= 5 for p in parts):
+                        parts[0] = parts[0] + '.'
                         parts[1] = parts[1][0].upper() + parts[1][1:]
                         final_chunks.extend(parts)
                     else:
@@ -1075,9 +1073,9 @@ class BrandVoicePassAgent(BaseAgent):
     def _fix_stiff_transitions(self, article: str) -> tuple[str, int]:
         """Replace stiff transitions with conversational bridges."""
         bridges = {
-            "furthermore": "And here\u2019s the thing:",
+            "furthermore": "And here's the thing:",
             "additionally": "On top of that,",
-            "moreover": "What\u2019s more,",
+            "moreover": "What's more,",
             "consequently": "So naturally,",
             "subsequently": "After that,",
             "nevertheless": "But still,",
@@ -1086,15 +1084,15 @@ class BrandVoicePassAgent(BaseAgent):
             "in summary": "The short version:",
             "in essence": "Basically,",
             "it is important to note": "Worth knowing:",
-            "it should be noted": "Here\u2019s the thing:",
-            "it is worth noting": "Here\u2019s the thing:",
+            "it should be noted": "Here's the thing:",
+            "it is worth noting": "Here's the thing:",
             "as mentioned above": "As we covered,",
             "as previously stated": "Like we said,",
             "as discussed earlier": "As we talked about,",
             "with that being said": "That said,",
             "that being said": "That said,",
-            "in today\u2019s": "In the current",
-            "in the modern": "In today\u2019s",
+            "in today's": "In the current",
+            "in the modern": "In today's",
         }
 
         count = 0
@@ -1207,7 +1205,7 @@ class BrandVoicePassAgent(BaseAgent):
             examples = [f"'{t}' (line {m[0]})" for t, m in found_transitions[:5]]
             issues.append(
                 f"STIFF TRANSITIONS FOUND: {', '.join(examples)}. "
-                f"Replace with conversational bridges: 'Here\u2019s the thing though,' 'But wait,' "
+                f"Replace with conversational bridges: 'Here's the thing though,' 'But wait,' "
                 f"'Which brings us to,' 'And honestly,' etc."
             )
         report_lines.append(f"Stiff transitions: {len(found_transitions)} found (target: 0)")

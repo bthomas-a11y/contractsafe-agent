@@ -138,3 +138,91 @@ def get_blog_post(post_id: str) -> dict:
         "slug": data.get("slug"),
         "content_length": len(data.get("postBody", "")),
     }
+
+
+def _get_template_post() -> dict:
+    """Fetch a recent published post to use as a template for cloning."""
+    resp = httpx.get(
+        f"{HUBSPOT_BASE}/cms/v3/blogs/posts",
+        headers=_headers(),
+        params={"limit": 10, "state": "PUBLISHED"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    posts = resp.json().get("results", [])
+    if not posts:
+        raise ValueError("No published blog posts found to use as template.")
+    # Pick the most recent one with substantial content
+    for post in posts:
+        if len(post.get("postBody", "")) > 1000:
+            return post
+    return posts[0]
+
+
+def clone_and_replace(
+    title: str,
+    article_md: str,
+    slug: str = "",
+    meta_description: str = "",
+) -> dict:
+    """Clone an existing blog post and replace its content with new article.
+
+    Fetches a template post to inherit layout/settings, creates a new DRAFT
+    with the article content converted to HubSpot-formatted HTML.
+
+    Returns dict with 'id', 'preview_url', 'state', and 'edit_url'.
+    """
+    from tools.html_export import markdown_to_html
+
+    template = _get_template_post()
+    html_body = markdown_to_html(article_md)
+
+    # Build payload from template, replacing content fields
+    payload = {
+        "name": title,
+        "contentGroupId": template["contentGroupId"],
+        "postBody": html_body,
+    }
+
+    # Inherit template settings where available
+    for field in ["templatePath", "layoutSections", "widgetContainers",
+                  "themeSettingsValues"]:
+        if template.get(field):
+            payload[field] = template[field]
+
+    if slug:
+        payload["slug"] = f"blog/{slug}"
+    if meta_description:
+        payload["metaDescription"] = meta_description
+
+    resp = httpx.post(
+        f"{HUBSPOT_BASE}/cms/v3/blogs/posts",
+        headers=_headers(),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    post_id = data.get("id", "unknown")
+
+    # Get portal ID for the edit URL
+    portal_id = ""
+    try:
+        acct_resp = httpx.get(
+            f"{HUBSPOT_BASE}/account-info/v3/details",
+            headers=_headers(),
+            timeout=10,
+        )
+        if acct_resp.status_code == 200:
+            portal_id = str(acct_resp.json().get("portalId", ""))
+    except Exception:
+        pass
+
+    edit_url = f"https://app.hubspot.com/content/{portal_id}/blog/{post_id}/edit" if portal_id else ""
+
+    return {
+        "id": post_id,
+        "preview_url": data.get("url", ""),
+        "edit_url": edit_url,
+        "state": data.get("state", "DRAFT"),
+    }

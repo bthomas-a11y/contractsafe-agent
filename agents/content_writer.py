@@ -27,7 +27,13 @@ class ContentWriterAgent(BaseAgent):
         if len(h2s) > max_sections:
             self.progress(f"Capping H2s from {len(h2s)} to {max_sections} (for {state.target_word_count}-word target)")
             h2s = h2s[:max_sections]
-        chunks = self._split_h2s(h2s)
+        # Dynamic per-section word guidance based on target
+        num_sections = len(h2s) or 1
+        words_per_section = max(250, (state.target_word_count - 200) // num_sections)
+        chunks = self._split_h2s(h2s, words_per_section)
+        wps_low = words_per_section - 25
+        wps_high = words_per_section + 75  # bias upward — LLMs tend to undershoot
+        section_guidance = f"~{wps_low}-{wps_high} words per section"
 
         # --- Call 1: Intro + TL;DR + first chunk of H2s ---
         self.progress(f"Writing intro + first {len(chunks[0])} sections...")
@@ -39,7 +45,7 @@ H2 outline: {', '.join(h2s)}
 Key facts: {self._condense_facts(state)}
 
 Write: metaphor declaration (one sentence), H1, intro (<150 words), TL;DR (3-5 bullets), then sections: {first_sections}.
-~250-350 words per section. Stop after the last section listed.
+{section_guidance}. Stop after the last section listed.
 {f'Note: {state.additional_instructions}' if state.additional_instructions else ''}"""
 
         part1 = self.call_llm(CONTENT_WRITER_SYSTEM, intro_prompt)
@@ -61,7 +67,7 @@ Write: metaphor declaration (one sentence), H1, intro (<150 words), TL;DR (3-5 b
 Keyword: {state.target_keyword}
 Metaphor: {metaphor}
 {f'Product info: {state.product_knowledge[:500]}' if is_last and state.product_knowledge else ''}
-~250-350 words per section. Same voice. Start with the H2 heading."""
+{section_guidance}. Same voice. Start with the H2 heading."""
 
             part = self.call_llm(CONTENT_WRITER_SYSTEM, continue_prompt)
             if len(part) < 500:
@@ -76,13 +82,21 @@ Metaphor: {metaphor}
         self.log(f"Draft complete: ~{word_count} words ({len(chunks)} calls)")
         return state
 
-    def _split_h2s(self, h2s: list[str]) -> list[list[str]]:
-        """Split H2s into chunks of 2-3 for multi-call generation."""
+    def _split_h2s(self, h2s: list[str], words_per_section: int = 300) -> list[list[str]]:
+        """Split H2s into chunks for multi-call generation.
+
+        Chunk size adapts to per-section word count so each call stays under
+        ~800 words of output (well within Opus 180s timeout).
+        """
         if not h2s:
             return [["Introduction"]]
 
+        # Target ~800 words max per call. First call also has intro+TL;DR (~200 words).
+        max_words_per_call = 800
+        chunk_size = max(1, max_words_per_call // max(words_per_section, 200))
+        chunk_size = min(chunk_size, 3)  # never more than 3 sections per call
+
         chunks = []
-        chunk_size = 3 if len(h2s) <= 6 else 2
         for i in range(0, len(h2s), chunk_size):
             chunks.append(h2s[i:i + chunk_size])
 

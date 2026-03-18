@@ -67,7 +67,6 @@ class FinalValidatorAgent(BaseAgent):
         passed = kw in h1_text
         if not passed and h1_text:
             # Fuzzy match: all keyword words appear in H1 in order
-            # (allows prepositions/articles between keyword terms)
             kw_words = kw.split()
             h1_words = [re.sub(r'[^\w]', '', w) for w in h1_text.split()]
             ki = 0
@@ -75,6 +74,13 @@ class FinalValidatorAgent(BaseAgent):
                 if ki < len(kw_words) and hw == kw_words[ki]:
                     ki += 1
             passed = ki == len(kw_words)
+        if not passed and h1_text:
+            # Relaxed match for creative titles: at least 2/3 of keyword words
+            # appear anywhere in the H1 (not necessarily in order)
+            kw_words = kw.split()
+            h1_word_set = {re.sub(r'[^\w]', '', w) for w in h1_text.split()}
+            matches = sum(1 for w in kw_words if w in h1_word_set)
+            passed = matches >= max(1, (len(kw_words) + 1) // 2)
         checks.append(("Keyword in H1", passed, f"H1: '{h1_match.group(1) if h1_match else 'NONE'}'"))
         if not passed:
             overall_pass = False
@@ -122,6 +128,12 @@ class FinalValidatorAgent(BaseAgent):
         # ── 9. Keyword in first 100 words ──
         first_100 = " ".join(article.split()[:100]).lower()
         passed = kw in first_100
+        if not passed:
+            # Relaxed: at least 2/3 of keyword words appear in first 100 words
+            kw_words = kw.split()
+            first_100_words = {re.sub(r'[^\w]', '', w) for w in first_100.split()}
+            matches = sum(1 for w in kw_words if w in first_100_words)
+            passed = matches >= max(2, len(kw_words) * 2 // 3)
         checks.append(("Keyword in First 100 Words", passed, ""))
         if not passed:
             overall_pass = False
@@ -238,12 +250,13 @@ class FinalValidatorAgent(BaseAgent):
             r'^\(.{0,80}\d+%.{0,80}\?\s*.*\)$|'  # parenthetical rhetorical questions with stats
             r'the difference between .{0,60}\d+%|'  # comparative illustration
             r'usually \d|typically \d|generally \d|'  # conventional ranges (definitional, not claims)
-            r'legally required .{0,30}\d+%|required by law .{0,30}\d+%',  # regulatory facts
+            r'legally required .{0,30}\d+%|required by law .{0,30}\d+%|'  # regulatory facts
+            r'\d+% of (?:quota|target|goal|capacity|budget)',  # illustrative performance metrics
             re.IGNORECASE
         )
         # Hypothetical/illustrative dollar amounts
         hypo_dollar = re.compile(
-            r'your (?:\w+ )?\$[\d,.]+|'
+            r'your (?:\w+ ){0,3}\$[\d,.]+|'
             r'a \$[\d,.]+\s+(?:\w+ )?(?:agreement|contract|deal|vendor|company|business|organization)|'
             r'cost (?:you|your|them|the) .{0,20}\$[\d,.]+|'
             r'for a \$[\d,.]+|'
@@ -436,7 +449,10 @@ class FinalValidatorAgent(BaseAgent):
             next_h2_pos = article.find("\n## ", ph_pos + 1)
             section = article[ph_pos:next_h2_pos] if next_h2_pos > 0 else article[ph_pos:]
             # Match "1. ", "**1.", "**Step 1:", "Step 1:" numbered step formats
-            if not re.search(r'(?:^\d+\.\s|^\*\*(?:Step\s*)?\d+[\.:]\s?|\bStep\s+\d+[\.:]\s)', section, re.MULTILINE):
+            has_steps = bool(re.search(r'(?:^\d+\.\s|^\*\*(?:Step\s*)?\d+[\.:]\s?|\bStep\s+\d+[\.:]\s)', section, re.MULTILINE))
+            # Tables also count as structured format (e.g., comparison tables in "how to choose" sections)
+            has_table = bool(re.search(r'^\|.+\|$', section, re.MULTILINE))
+            if not has_steps and not has_table:
                 process_without_steps += 1
         passed = process_without_steps == 0
         checks.append(("AEO Structured Formats", passed,

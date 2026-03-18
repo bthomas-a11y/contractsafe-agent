@@ -71,82 +71,74 @@ def warmup_cli():
     t.start()
 
 
-def _derive_keyword_from_title(title: str, con: Console) -> str:
-    """Extract the best primary keyword from a title using SEMRush volume data.
+def _quick_haiku_call(system_prompt: str, user_prompt: str, timeout: int = 15) -> str:
+    """Lightweight Haiku call for keyword derivation. No heartbeat, no budget.
+    Returns empty string on any failure (timeout, error, etc.)."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    try:
+        proc = subprocess.Popen(
+            [CLAUDE_CLI, "-p", "--model", "haiku", "--system-prompt", system_prompt,
+             "--setting-sources", "user"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+        stdout, _ = proc.communicate(input=user_prompt, timeout=timeout)
+        return stdout.strip() if proc.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, Exception):
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+        return ""
 
-    Algorithm:
-    1. Generate all 2-4 word contiguous subphrases from the title.
-    2. Send them to SEMRush batch_keyword_overview (single API call).
-    3. Score each candidate: topic specificity first, volume as tiebreaker.
-       - "contract change management" (3 topic words, 70 vol) beats
-         "change management" (2 topic words, 27,100 vol) because it's more
-         specific to the article. Generic high-volume keywords are useless
-         as primary targets — the article will rank for them naturally as
-         subsets of the more specific phrase.
-    4. If SEMRush is unavailable or returns no data, fall back to heuristics.
+
+def _derive_keyword_from_title(title: str, con: Console) -> str:
+    """Derive the best primary keyword for an article title.
+
+    Strategy:
+    1. Ask Haiku to suggest 5-8 keyword candidates (understands context, creative titles).
+    2. Send candidates to SEMRush batch_keyword_overview (one API call).
+    3. Pick the candidate with the best combination of search volume and topic relevance.
+    4. If Haiku or SEMRush fail, use Haiku's top suggestion as-is.
+    5. If everything fails, fall back to simple heuristic extraction.
     """
     import re as _re
     from config import SEMRUSH_API_KEY
 
-    # ── Clean the title ──
-    cleaned = title.lower().strip().rstrip(".:!?")
+    # ── Step 1: Ask Haiku for keyword candidates ──
+    con.print("  [dim]Asking Haiku for keyword candidates...[/dim]")
+    haiku_system = (
+        "You are an SEO keyword researcher. Given a blog post title, suggest exactly 8 primary keyword "
+        "candidates — the 2-4 word phrases someone would type into Google to find this article. "
+        "Rules:\n"
+        "- Each keyword must be 2-4 words\n"
+        "- Keywords should be specific to the actual topic, not generic\n"
+        "- Include the most obvious/literal keyword AND creative alternatives\n"
+        "- For creative/indirect titles, infer the real topic (e.g., 'Why Your Legal Team Is Drowning' → 'legal operations efficiency')\n"
+        "- Output ONLY the keywords, one per line, no numbering, no explanation"
+    )
+    haiku_response = _quick_haiku_call(haiku_system, f"Title: {title}", timeout=15)
 
-    # ── Generate candidate subphrases ──
-    stop_words = {
-        "a", "an", "the", "and", "or", "but", "for", "of", "to", "in", "on",
-        "at", "by", "is", "are", "was", "were", "be", "been", "your", "our",
-        "their", "its", "this", "that", "these", "those", "with", "vs",
-    }
-    # Format/filler words that appear in titles but aren't real topic terms
-    filler_words = {
-        "guide", "best", "practices", "tips", "strategies", "ways", "steps",
-        "key", "essential", "important", "complete", "ultimate", "top",
-        "comprehensive", "simple", "easy", "quick", "effective", "proven",
-        "common", "critical", "mistakes", "avoid",
-    }
+    haiku_candidates = []
+    if haiku_response:
+        for line in haiku_response.strip().split("\n"):
+            kw = line.strip().lower().lstrip("0123456789.-) ").strip()
+            # Remove any markdown or bullet formatting
+            kw = _re.sub(r"^[\*\-\•]\s*", "", kw).strip()
+            if kw and 1 <= len(kw.split()) <= 5:
+                haiku_candidates.append(kw)
+        con.print(f"  [dim]Haiku suggested {len(haiku_candidates)} candidates: {', '.join(haiku_candidates[:5])}...[/dim]")
+    else:
+        con.print("  [yellow]Haiku call failed or timed out, falling back to heuristic[/yellow]")
 
-    # Remove numbers and non-alpha chars (except hyphens within words)
-    words = _re.findall(r"[a-z]+(?:-[a-z]+)*", cleaned)
-    # Content words = not stop words
-    content_words = [w for w in words if w not in stop_words]
-    # Topic words = content words that aren't filler (the real subject matter)
-    topic_words_set = {w for w in content_words if w not in filler_words}
-
-    candidates = set()
-    # Generate 2-word, 3-word, and 4-word contiguous subphrases from content words
-    for n in (2, 3, 4):
-        for i in range(len(content_words) - n + 1):
-            phrase = " ".join(content_words[i:i + n])
-            candidates.add(phrase)
-    # Also try from the original word order (preserving prepositions in context)
-    for n in (2, 3, 4, 5):
-        for i in range(len(words) - n + 1):
-            phrase = " ".join(words[i:i + n])
-            # Skip if it starts or ends with a stop word
-            if words[i] in stop_words or words[i + n - 1] in stop_words:
-                continue
-            candidates.add(phrase)
-
-    if not candidates:
-        con.print("  [yellow]No keyword candidates extracted from title[/yellow]")
-        return " ".join(content_words[:5]) if content_words else cleaned
-
-    candidate_list = list(candidates)
-    con.print(f"  [dim]Extracted {len(candidate_list)} keyword candidates from title[/dim]")
-
-    def _topic_specificity(phrase: str) -> int:
-        """Count how many topic-specific words are in a phrase."""
-        return sum(1 for w in phrase.split() if w in topic_words_set)
-
-    # ── SEMRush validation ──
-    if SEMRUSH_API_KEY:
+    # ── Step 2: Validate candidates via SEMRush ──
+    if haiku_candidates and SEMRUSH_API_KEY:
         from tools.semrush import batch_keyword_overview
         con.print("  [dim]Checking search volumes via SEMRush...[/dim]")
-        volume_data = batch_keyword_overview(candidate_list)
+        volume_data = batch_keyword_overview(haiku_candidates)
 
         if volume_data:
-            # Build scored list: (topic_specificity, volume, keyword)
-            # Sort by topic specificity DESC first, then volume DESC as tiebreaker
             scored = []
             for entry in volume_data:
                 kw = entry.get("Keyword", entry.get("Ph", "")).lower()
@@ -156,47 +148,43 @@ def _derive_keyword_from_title(title: str, con: Console) -> str:
                 except (ValueError, TypeError):
                     vol = 0
                 if vol < 10:
-                    continue  # skip near-zero volume
-                specificity = _topic_specificity(kw)
-                scored.append((specificity, vol, kw))
+                    continue
+                scored.append((vol, kw))
 
             if scored:
-                scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                best_specificity, best_vol, best_kw = scored[0]
-
+                scored.sort(reverse=True)
+                best_vol, best_kw = scored[0]
                 con.print(
-                    f"  [green]SEMRush: best keyword = '{best_kw}' "
-                    f"(topic specificity: {best_specificity}, volume: {best_vol:,}/mo)[/green]"
+                    f"  [green]Best keyword: '{best_kw}' "
+                    f"(volume: {best_vol:,}/mo)[/green]"
                 )
-                # Log runner-up candidates for transparency
-                for specificity, vol, kw in scored[1:4]:
-                    con.print(
-                        f"    [dim]runner-up: '{kw}' "
-                        f"(specificity: {specificity}, volume: {vol:,})[/dim]"
-                    )
+                for vol, kw in scored[1:4]:
+                    con.print(f"    [dim]runner-up: '{kw}' (volume: {vol:,})[/dim]")
                 return best_kw
             else:
-                con.print("  [yellow]SEMRush: no candidates with volume >= 10, falling back[/yellow]")
+                con.print("  [yellow]SEMRush: no candidates with volume >= 10[/yellow]")
         else:
-            con.print("  [yellow]SEMRush batch call returned empty, falling back[/yellow]")
-    else:
-        con.print("  [yellow]SEMRush not configured, using heuristic keyword derivation[/yellow]")
+            con.print("  [yellow]SEMRush batch call returned empty[/yellow]")
 
-    # ── Heuristic fallback (no SEMRush) ──
-    # Score by topic specificity, then by length (longer = more specific)
-    scored_heuristic = sorted(
-        candidates,
-        key=lambda c: (_topic_specificity(c), len(c.split())),
-        reverse=True,
-    )
-    # Filter to 2-4 word phrases only
-    scored_heuristic = [c for c in scored_heuristic if 2 <= len(c.split()) <= 4]
-    if scored_heuristic:
-        chosen = scored_heuristic[0]
-        con.print(f"  [dim]Heuristic keyword: '{chosen}'[/dim]")
+    # ── Step 3: Use Haiku's top suggestion as-is (no SEMRush validation) ──
+    if haiku_candidates:
+        # Prefer 2-3 word candidates
+        short_candidates = [c for c in haiku_candidates if 2 <= len(c.split()) <= 3]
+        chosen = short_candidates[0] if short_candidates else haiku_candidates[0]
+        con.print(f"  [dim]Using Haiku suggestion: '{chosen}'[/dim]")
         return chosen
 
-    return " ".join(content_words[:4]) if content_words else cleaned
+    # ── Step 4: Last-resort heuristic (Haiku AND SEMRush both failed) ──
+    con.print("  [yellow]All methods failed, using basic heuristic[/yellow]")
+    cleaned = title.lower().strip()
+    cleaned = _re.sub(r"\([^)]*\)", "", cleaned)
+    cleaned = cleaned.replace("\u2014", " ").replace("\u2013", " ").replace("&", " ")
+    cleaned = " ".join(cleaned.split())
+    stop = {"a", "an", "the", "and", "or", "but", "for", "of", "to", "in", "on",
+            "at", "by", "is", "are", "your", "our", "their", "this", "that", "with",
+            "how", "what", "why", "when", "best", "top", "guide", "vs", "from"}
+    words = [w for w in _re.findall(r"[a-z]+", cleaned) if w not in stop and len(w) > 2]
+    return " ".join(words[:3]) if words else title.lower().strip()
 
 
 AGENT_INFO = [
@@ -1663,7 +1651,7 @@ def run_pipeline(cli_args: argparse.Namespace):
 
 
 def _publish_all(state: PipelineState, output_dir: Path):
-    """Single publish step: Google Drive + Spreadsheet + Asana comment."""
+    """Single publish step: Google Drive + Spreadsheet + HubSpot draft + Asana comment."""
 
     doc_url = None
 
@@ -1718,7 +1706,29 @@ def _publish_all(state: PipelineState, output_dir: Path):
     except Exception as e:
         console.print(f"[yellow]Spreadsheet update failed: {e}[/yellow]")
 
-    # ── 3. Asana comment ──
+    # ── 3. HubSpot CMS draft ──
+    hubspot_url = None
+    try:
+        from tools.hubspot_cms import clone_and_replace
+        article = state.final_article or state.aeo_pass_article or state.draft_article
+        # Extract H1 for the post title
+        import re as _re
+        h1_match = _re.search(r'^# (.+)$', article, _re.MULTILINE)
+        hs_title = h1_match.group(1) if h1_match else state.topic
+        hs_slug = output_dir.name  # e.g. "contract-deadlines"
+        console.print("[cyan]Creating HubSpot blog draft...[/cyan]")
+        hs_result = clone_and_replace(
+            title=hs_title,
+            article_md=article,
+            slug=hs_slug,
+            meta_description=state.meta_description or "",
+        )
+        hubspot_url = hs_result.get("edit_url") or hs_result.get("preview_url")
+        console.print(f"[bold green]HubSpot draft created:[/bold green] {hubspot_url}")
+    except Exception as e:
+        console.print(f"[yellow]HubSpot draft creation failed: {e}[/yellow]")
+
+    # ── 4. Asana comment ──
     try:
         from config import ASANA_ACCESS_TOKEN, ASANA_WORKSPACE_GID
         from tools.asana_api import search_tasks, add_comment
@@ -1744,6 +1754,8 @@ def _publish_all(state: PipelineState, output_dir: Path):
                 ]
                 if doc_url:
                     lines.insert(2, f"Google Doc: {doc_url}")
+                if hubspot_url:
+                    lines.append(f"HubSpot Draft: {hubspot_url}")
                 lines.append("")
                 lines.append(f"-- Generated {date.today().strftime('%Y-%m-%d')}")
 
