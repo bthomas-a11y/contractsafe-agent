@@ -41,6 +41,45 @@ STIFF_TRANSITIONS = [
 # ── Module-level mechanical fix functions (used by Agent 8 AND Agent 13) ──
 
 
+def _split_list_item_trailing_prose(text: str) -> str:
+    """Split list items that have a prose paragraph appended on the same line.
+
+    Detects patterns like:
+      8. **Item text** (parenthetical) Next paragraph starts here.
+      - Bullet item content. Next paragraph starts here.
+    And splits them into separate lines.
+    """
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        # Match numbered or bullet list items
+        if not re.match(r'^(?:\d+[\.\)]\s|[-*]\s)', stripped):
+            result.append(line)
+            continue
+        # Look for a closing pattern followed by a capital letter starting a new sentence
+        # Patterns: ") Capital", ".) Capital", ".**) Capital", ".** Capital"
+        m = re.search(r'(\)|\*\*\)?|\.)\s{1,3}([A-Z][a-z])', stripped)
+        if not m:
+            result.append(line)
+            continue
+        # Make sure the split point is past the first 30 chars (not splitting a short item)
+        if m.start() < 30:
+            result.append(line)
+            continue
+        # Check that the part before looks like a complete list item
+        # and the part after looks like a prose sentence (not another list marker)
+        after = stripped[m.start() + len(m.group(1)):].strip()
+        if after and not re.match(r'^[-*]\s|^\d+[\.\)]\s', after):
+            before = stripped[:m.start() + len(m.group(1))]
+            result.append(before)
+            result.append('')
+            result.append(after)
+            continue
+        result.append(line)
+    return '\n'.join(result)
+
+
 def _normalize_markdown(article: str) -> str:
     """Fix structurally broken markdown: collapsed tables, concatenated lists, broken links.
 
@@ -52,6 +91,7 @@ def _normalize_markdown(article: str) -> str:
     article = _fix_single_line_tables(article)
     article = _fix_concatenated_bullets(article)
     article = _fix_concatenated_numbered_items(article)
+    article = _split_list_item_trailing_prose(article)
     article = _fix_broken_links(article)
     article = _merge_bullet_orphans(article)
     article = _strip_trailing_social_copy(article)
