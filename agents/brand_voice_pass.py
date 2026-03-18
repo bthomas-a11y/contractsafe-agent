@@ -452,6 +452,12 @@ def apply_mechanical_fixes(article: str) -> str:
     # These are truncated research titles that leaked into the output.
     article = _strip_source_artifacts(article)
 
+    # ── 2b. Strip lines with truncated words from garbled research data ──
+    article = _strip_truncated_lines(article)
+
+    # ── 2c. Remove empty parentheses left by citation removal ──
+    article = re.sub(r'\s*\(\s*\)', '', article)
+
     # ── 3. Straight quotes → curly quotes ──
     article = _curl_quotes(article)
 
@@ -536,6 +542,8 @@ def apply_mechanical_fixes(article: str) -> str:
     # ":. " → colon followed by period (from content removal)
     article = article.replace(':. ', ': ')
     article = article.replace(':.\n', ':\n')
+    # ".." → double period (from content insertion/removal)
+    article = re.sub(r'\.\.(?!\.)' , '.', article)  # ".." → "." but not "..."
     # "?.\n" or "!.\n" → remove trailing period after question/exclamation
     article = re.sub(r'([?!])\.\s', r'\1 ', article)
     # ". But." → sentence fragment from content removal (". But [removed stat]. That's")
@@ -707,23 +715,105 @@ def _strip_source_artifacts(article: str) -> str:
             continue  # "According to 16 Contract Management Statistics..." — pure citation artifact
         if stripped and '|' in stripped and stripped.count('|') >= 3 and not stripped.startswith('|'):
             continue  # garbled table data leaked from sources
+
+        # Remove entire lines starting with "According to [page title]"
+        # Page titles contain ?, :, &, or are truncated (>50 chars)
+        at_match = re.match(r'^According to ([^,\n]+)', stripped)
+        if at_match:
+            src_name = at_match.group(1).strip().rstrip('.')
+            # Check if last word looks truncated (no vowels, or single letter)
+            last_word = src_name.split()[-1].lower() if src_name.split() else ""
+            looks_truncated = (
+                len(last_word) >= 2
+                and not last_word.isdigit()  # "2026" is a year, not truncated
+                and not re.search(r'[aeiouy]', last_word)  # no vowels = likely truncated
+                and last_word not in ('by', 'my', 'gym', 'lynx', 'myth', 'sync', 'hymn')
+            ) or (
+                len(last_word) == 1 and last_word.isalpha()  # single letter = truncated
+            )
+            is_garbled = (
+                '?' in src_name          # Page title with question mark
+                or ':' in src_name       # Page title with colon
+                or '&' in src_name       # Truncated title with ampersand
+                or len(src_name) > 50    # Too long for a real org name
+                or looks_truncated       # Ends with truncated word (no vowels)
+            )
+            if is_garbled:
+                continue  # Skip the entire line
+
+        # Strip parenthetical attributions: "(according to ...)"
+        line = re.sub(r'\s*\([Aa]ccording to [^)]+\)', '', line)
+
         # Strip ", according to [Truncated Source Title]" at end of sentences
-        # Match: comma + "according to" + long non-link text (35+ chars = likely
-        # a truncated article title, not a real source like "Deloitte" or
-        # "World Commerce & Contracting" which are under 30 chars)
+        # Case-insensitive. Match: comma + "according to" + long non-link text
+        # (35+ chars = likely a truncated article title, not "Deloitte")
         line = re.sub(
-            r',?\s*according to [A-Z0-9][^[\n]{35,}?(?:\.|$)',
+            r',?\s*[Aa]ccording to [A-Z0-9][^[\n]{35,}?(?:\.|$)',
             lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
             line
         )
         # Also strip article titles used as sources (contain ? or start with number)
-        # e.g., "according to What is Contract Risk Management?."
-        # e.g., "according to 50+ Risk Management Statistics to Know in 2026."
         line = re.sub(
-            r',?\s*according to [A-Z0-9][^[\n]*?\?[.\s]',
+            r',?\s*[Aa]ccording to [A-Z0-9][^[\n]*?\?[.\s]',
             lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
             line
         )
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def _strip_truncated_lines(article: str) -> str:
+    """Remove lines ending with truncated words from garbled research data.
+
+    Detects lines ending with clearly truncated words: consonant-only words
+    or words ending in rare double consonants that aren't real English words.
+    e.g., "...require a writt." or "...contract value thr."
+    """
+    _ABBREVS = frozenset({
+        'etc', 'inc', 'ltd', 'corp', 'avg', 'min', 'max', 'dept', 'govt',
+        'intl', 'mgmt', 'natl', 'org', 'prof', 'est', 'fig', 'ref', 'sec',
+        'vol', 'assoc', 'bros', 'co', 'dr', 'jr', 'sr', 'vs', 'pt', 'ed',
+        'rev', 'st', 'no', 'mr', 'mrs', 'ms',
+    })
+    # Real English words ending in rare double consonants (tt, dd, gg, nn, pp, rr, zz)
+    _DOUBLE_CONSONANT_WORDS = frozenset({
+        'butt', 'mutt', 'putt', 'watt', 'mitt', 'matt',
+        'add', 'odd',
+        'egg',
+        'inn', 'ann',
+        'app',
+        'err', 'burr', 'purr',
+        'buzz', 'fizz', 'fuzz', 'jazz', 'razz',
+    })
+
+    lines = article.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Only check prose lines (skip headings, tables, bullets, blank lines)
+        if not stripped or stripped.startswith('#') or stripped.startswith('|') or stripped.startswith('- '):
+            cleaned.append(line)
+            continue
+        # Skip lines with markdown links (likely intentional content)
+        if '](http' in stripped:
+            cleaned.append(line)
+            continue
+
+        # Check for truncated word at end of line
+        trunc_match = re.search(r'\b([a-z]{2,6})\.\s*$', stripped)
+        if trunc_match:
+            word = trunc_match.group(1).lower()
+            if word not in _ABBREVS:
+                # No vowels → clearly truncated (e.g., "thr", "str")
+                if not re.search(r'[aeiouy]', word):
+                    continue  # Remove the line
+                # Ends with rare double consonant → likely truncated (e.g., "writt")
+                if (len(word) >= 3
+                        and word[-1] == word[-2]
+                        and word[-1] not in 'lsf'  # ll, ss, ff are common endings
+                        and word not in _DOUBLE_CONSONANT_WORDS):
+                    continue  # Remove the line
+
         cleaned.append(line)
     return "\n".join(cleaned)
 
@@ -757,8 +847,19 @@ def _split_long_paragraphs(article: str) -> str:
                 lambda m: m.group(0).replace('.', '\x00').replace('!', '\x01').replace('?', '\x02'),
                 para_text
             )
+            # Protect abbreviation periods from being treated as sentence boundaries
+            protected = re.sub(
+                r'\b([A-Z])\.([A-Z])\.',
+                lambda m: m.group(1) + '\x03' + m.group(2) + '\x03',
+                protected
+            )
+            protected = re.sub(
+                r'\b(e\.g|i\.e|etc|vs|Dr|Mr|Mrs|Ms|Jr|Sr|St|No)\.',
+                lambda m: m.group(0).replace('.', '\x03'),
+                protected
+            )
             sentences = re.split(r'(?<=[.!?])[)\]"\'"\u201d\u2019]*\s+', protected)
-            sentences = [s.replace('\x00', '.').replace('\x01', '!').replace('\x02', '?') for s in sentences]
+            sentences = [s.replace('\x00', '.').replace('\x01', '!').replace('\x02', '?').replace('\x03', '.') for s in sentences]
             chunks = _chunk_by_limit(sentences, 42)
             # If a chunk is still over 42 words (single long sentence),
             # try splitting at colons or semicolons as a fallback.

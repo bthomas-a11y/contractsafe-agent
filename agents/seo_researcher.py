@@ -172,13 +172,20 @@ class SEOResearcherAgent(BaseAgent):
                     if h2 and len(h2) > 5:
                         add_if_unique(h2)
         else:
-            # Fallback: generate basic structure when no competitor data
+            # Fallback: generate basic structure when no competitor data.
+            # Use varied phrasing so long keywords (4+ words) don't trigger
+            # dedup overlap. The writer will still use the keyword naturally.
             kw = state.target_keyword
-            add_if_unique(f"What Is {kw.title()}?")
-            add_if_unique(f"Why {kw.title()} Matters")
-            add_if_unique(f"Key Benefits of {kw.title()}")
-            add_if_unique(f"How to Get Started with {kw.title()}")
-            add_if_unique(f"Common {kw.title()} Mistakes to Avoid")
+            kw_title = kw.title()
+            fallback_h2s = [
+                f"What Is {kw_title}?",
+                f"Common {kw_title} Mistakes to Avoid",
+                f"Why {kw_title} Matters for Your Organization",
+                f"How to Choose the Right Solution",
+                f"Key Features to Look For",
+            ]
+            for h in fallback_h2s:
+                add_if_unique(h)
 
         # 2. Add question-based H2s from PAA data (top 3-4)
         question_count = 0

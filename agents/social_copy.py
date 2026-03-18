@@ -81,30 +81,49 @@ Write the meta description, LinkedIn post, and X/Twitter post."""
         return h1, h2_list, first_300
 
     def _parse_response(self, state: PipelineState, response: str):
-        """Parse the social copy response into individual components."""
+        """Parse the social copy response into individual components.
+
+        Flexible header detection — matches variations like:
+        "META DESCRIPTION:", "Meta Description", "**Meta Description**",
+        "## Meta Description", "1. Meta Description", etc.
+        """
         lines = response.split("\n")
         current_section = None
         sections = {"meta": [], "linkedin": [], "twitter": []}
 
+        # Flexible section header patterns (order matters — check most specific first)
+        meta_pat = re.compile(r"meta\s*desc", re.IGNORECASE)
+        linkedin_pat = re.compile(r"linkedin", re.IGNORECASE)
+        twitter_pat = re.compile(r"x[/\s]twitter|twitter|x\s+post", re.IGNORECASE)
+        skip_pat = re.compile(r"character\s*count|char\s*count|word\s*count|\d+\s*char", re.IGNORECASE)
+
         for line in lines:
-            upper = line.strip().upper()
-            if "META DESCRIPTION" in upper and ":" in upper:
+            stripped = line.strip()
+            # Strip markdown formatting for header detection
+            clean = re.sub(r'^[#*\-\d.)\s]+', '', stripped).strip()
+            clean_upper = clean.upper()
+
+            # Detect section headers
+            if meta_pat.search(clean):
                 current_section = "meta"
-                after_colon = line.split(":", 1)[1].strip() if ":" in line else ""
-                if after_colon and "character" not in after_colon.lower():
-                    sections["meta"].append(after_colon)
+                # Extract inline content after colon if present
+                if ":" in stripped:
+                    after_colon = stripped.split(":", 1)[1].strip()
+                    if after_colon and not skip_pat.search(after_colon):
+                        sections["meta"].append(after_colon)
                 continue
-            elif "LINKEDIN POST" in upper:
+            elif linkedin_pat.search(clean) and len(clean.split()) <= 5:
                 current_section = "linkedin"
                 continue
-            elif "X/TWITTER" in upper or "TWITTER POST" in upper or "X POST" in upper:
+            elif twitter_pat.search(clean) and len(clean.split()) <= 5:
                 current_section = "twitter"
                 continue
-            elif "CHARACTER COUNT" in upper or "CHAR COUNT" in upper:
+            elif skip_pat.search(clean):
                 continue
 
-            if current_section and line.strip():
-                if any(h in line.strip().upper() for h in ["LINKEDIN POST", "X/TWITTER", "META DESC"]):
+            if current_section and stripped:
+                # Skip lines that are actually section headers for other sections
+                if any(pat.search(stripped) for pat in [meta_pat, linkedin_pat, twitter_pat]):
                     continue
                 sections[current_section].append(line)
 
@@ -112,7 +131,7 @@ Write the meta description, LinkedIn post, and X/Twitter post."""
         state.linkedin_post = "\n".join(sections["linkedin"]).strip()
         state.twitter_post = "\n".join(sections["twitter"]).strip()
 
-        # If parsing failed, store raw response
+        # If parsing failed, extract from raw response
         if not state.meta_description and not state.linkedin_post:
             state.meta_description = response[:160]
             state.linkedin_post = response

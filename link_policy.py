@@ -170,6 +170,58 @@ EVERGREEN_EXTERNAL_LINKS = [
     },
 ]
 
+# Evergreen internal links — used when search fails to find ContractSafe pages
+EVERGREEN_INTERNAL_LINKS = [
+    {
+        "url": "https://www.contractsafe.com/contract-management",
+        "title": "Contract Management Software",
+        "anchor": "contract management",
+        "keywords": ["contract", "management", "software", "platform"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/contract-lifecycle-management-challenges",
+        "title": "Contract Lifecycle Management Challenges",
+        "anchor": "contract lifecycle management",
+        "keywords": ["lifecycle", "clm", "challenges", "process"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/best-contract-lifecycle-management-software-features-2026",
+        "title": "Best CLM Software Features",
+        "anchor": "contract lifecycle management software",
+        "keywords": ["features", "software", "clm", "lifecycle"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/clm-vs-contract-management-solutions",
+        "title": "CLM vs Contract Management Solutions",
+        "anchor": "CLM vs contract management solutions",
+        "keywords": ["clm", "solutions", "comparison", "difference"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/contract-renewal-strategy",
+        "title": "Contract Renewal Strategy",
+        "anchor": "contract renewal",
+        "keywords": ["renewal", "strategy", "expiration", "deadline"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/best-practices",
+        "title": "Contract Management Best Practices",
+        "anchor": "contract management best practices",
+        "keywords": ["best", "practices", "compliance", "organize"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/tag/security-and-compliance",
+        "title": "Security and Compliance",
+        "anchor": "contract security and compliance",
+        "keywords": ["security", "compliance", "audit", "risk"],
+    },
+    {
+        "url": "https://www.contractsafe.com/blog/finance-contract-management",
+        "title": "Finance Contract Management",
+        "anchor": "finance contract management",
+        "keywords": ["finance", "procurement", "cost", "savings", "spend"],
+    },
+]
+
 
 def is_blocked(url: str) -> bool:
     """Check if a URL belongs to a blocked competitor domain."""

@@ -804,6 +804,8 @@ def supervisor_check(state: PipelineState, agent_num: int):
     assert_post_conditions cannot: comparing input vs output to detect silent failures,
     scanning for quality problems the agent should have fixed, and overriding pass
     signals when independent verification disagrees.
+
+    Agent 13 supervisor override sets pass_fail=False on critical issues.
     """
     import re as _re
 
@@ -889,10 +891,17 @@ def supervisor_check(state: PipelineState, agent_num: int):
         if mechanical:
             issues.append(f"Mechanical link phrases: {len(mechanical)}")
 
+        # Check duplicate link URLs
+        link_urls = [u.lower().rstrip("/") for _, u in all_links]
+        dup_urls = [u for u in set(link_urls) if link_urls.count(u) > 1]
+        if dup_urls:
+            issues.append(f"Duplicate link URLs: {dup_urls[:3]}")
+
         if issues and state.pass_fail:
+            state.pass_fail = False
             console.print(
                 f"  [red bold]SUPERVISOR OVERRIDE (Agent 13): Validator reported PASS but "
-                f"supervisor found issues: {'; '.join(issues)}. Investigate immediately.[/red bold]"
+                f"supervisor found issues — overriding to FAIL: {'; '.join(issues)}[/red bold]"
             )
 
 

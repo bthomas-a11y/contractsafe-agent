@@ -22,6 +22,7 @@ from link_policy import (
     MIN_INTERNAL_LINKS,
     MIN_EXTERNAL_LINKS,
     EVERGREEN_EXTERNAL_LINKS,
+    EVERGREEN_INTERNAL_LINKS,
     is_blocked,
     is_internal,
     get_source_tier,
@@ -55,11 +56,49 @@ class LinkResearcherAgent(BaseAgent):
             self.log(f"[yellow]Only {len(verified_internal)} internal links. Searching for more...[/yellow]")
             verified_internal = self._backfill_internal(verified_internal, state, topic_words)
 
+        # ── Phase 4b: Evergreen internal link fallbacks ──
+        if len(verified_internal) < MIN_INTERNAL_LINKS:
+            existing_urls = {l.get("url", "").lower().rstrip("/") for l in verified_internal}
+            topic_lower = {w.lower() for w in topic_words}
+            # Sort by relevance: most keyword overlap first
+            scored = sorted(
+                EVERGREEN_INTERNAL_LINKS,
+                key=lambda ev: len(topic_lower & set(ev["keywords"])),
+                reverse=True,
+            )
+            for ev in scored:
+                if len(verified_internal) >= MIN_INTERNAL_LINKS:
+                    break
+                if ev["url"].lower().rstrip("/") in existing_urls:
+                    continue
+                # All ContractSafe pages are valid internal links — add them
+                verified_internal.append({
+                    "url": ev["url"],
+                    "anchor": ev["anchor"],
+                    "section": "any",
+                    "relevance": "evergreen_fallback",
+                })
+                self.progress(f"  [cyan]EVERGREEN INTERNAL: {ev['url'][:60]}[/cyan]")
+
         if len(verified_external) < MIN_EXTERNAL_LINKS:
             self.log(f"[yellow]Only {len(verified_external)} external links. Searching for more...[/yellow]")
             verified_external = self._backfill_external(verified_external, state, topic_words)
 
-        # ── Phase 5: Build citation map programmatically ──
+        # ── Phase 5: Deduplicate by URL (keep first occurrence) ──
+        def _dedup_by_url(links: list[dict]) -> list[dict]:
+            seen_urls: set[str] = set()
+            deduped: list[dict] = []
+            for link in links:
+                url = link.get("url", "").lower().rstrip("/")
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    deduped.append(link)
+            return deduped
+
+        verified_internal = _dedup_by_url(verified_internal)
+        verified_external = _dedup_by_url(verified_external)
+
+        # ── Phase 6: Build citation map programmatically ──
         state.internal_links = verified_internal
         state.external_links = verified_external
         state.citation_map = self._build_citation_map_programmatic(state)

@@ -22,6 +22,9 @@ class SEOPassAgent(BaseAgent):
     def run(self, state: PipelineState) -> PipelineState:
         article = state.fact_check_article or state.voice_pass_article or state.draft_article
 
+        # ── Dedup existing link URLs (writer may have used same URL multiple times) ──
+        article = self._dedup_existing_links(article)
+
         # ── Audit ──
         self.progress("Auditing keyword density, links, and heading structure...")
         audit = self._audit(article, state)
@@ -34,6 +37,9 @@ class SEOPassAgent(BaseAgent):
         # ── Fix everything programmatically ──
         self.progress("Inserting internal and external links programmatically...")
         article, fixed = self._apply_all_fixes(article, issues, state)
+
+        # ── Dedup again after link insertion (may have added duplicate URLs) ──
+        article = self._dedup_existing_links(article)
 
         # ── Re-audit to see what remains ──
         re_audit = self._audit(article, state)
@@ -113,6 +119,12 @@ class SEOPassAgent(BaseAgent):
                     article = result
                     fixed.append("generic_anchors")
 
+            elif "KEYWORD STUFFING" in issue:
+                result = self._fix_keyword_overuse(article, state.target_keyword)
+                if result:
+                    article = result
+                    fixed.append("keyword_destuffing")
+
         return article, fixed
 
     def _fix_keyword_in_h2(self, article: str, keyword: str) -> str | None:
@@ -189,6 +201,151 @@ class SEOPassAgent(BaseAgent):
 
         return "\n".join(lines) if modified else None
 
+    def _fix_keyword_overuse(self, article: str, keyword: str) -> str | None:
+        """Remove excess keyword occurrences by replacing them with pronouns or synonyms.
+
+        Targets non-essential occurrences: those not in H1, H2, first paragraph,
+        key takeaways, or inside markdown links. Replaces with contextual pronouns
+        like "this process", "it", or just drops the keyword from appositives.
+        """
+        kw_lower = keyword.lower()
+        kw_word_count = len(keyword.split())
+
+        # Calculate target
+        word_count = len(article.split())
+        if kw_word_count >= 4:
+            ideal_max = max(4, word_count // 500)
+        else:
+            ideal_max = max(7, word_count // 200)
+
+        current_count = article.lower().count(kw_lower)
+        if current_count <= ideal_max:
+            return None
+
+        excess = current_count - ideal_max
+        lines = article.split("\n")
+        modified = False
+        removed = 0
+
+        # Identify protected lines (H1, H2, first body paragraph, key takeaways bullet, links)
+        first_body_idx = None
+        in_takeaways = False
+        protected_lines = set()
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("# ") or stripped.startswith("## "):
+                protected_lines.add(i)
+                if "takeaway" in stripped.lower() or "key " in stripped.lower():
+                    in_takeaways = True
+                else:
+                    in_takeaways = False
+                continue
+            if in_takeaways and stripped.startswith("- "):
+                protected_lines.add(i)
+                continue
+            if first_body_idx is None and stripped and not stripped.startswith("#"):
+                first_body_idx = i
+                protected_lines.add(i)
+                in_takeaways = False
+
+        # Remove excess from unprotected lines (bottom-up to preserve earlier occurrences)
+        for i in range(len(lines) - 1, -1, -1):
+            if removed >= excess:
+                break
+            if i in protected_lines:
+                continue
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            # Don't touch lines where keyword is inside a markdown link anchor
+            if f"[{kw_lower}" in stripped.lower() or f" {kw_lower}](" in stripped.lower():
+                continue
+
+            low = stripped.lower()
+            if kw_lower not in low:
+                continue
+
+            # Strategy 1: Remove ", a key aspect of <keyword>." appositives (added by _fix_keyword_underuse)
+            appositive = f", a key aspect of {keyword}"
+            if appositive.lower() in low:
+                new_stripped = stripped.replace(appositive, "").replace(appositive.lower(), "")
+                lines[i] = lines[i].replace(stripped, new_stripped)
+                modified = True
+                removed += 1
+                continue
+
+            # Strategy 2: Replace standalone keyword with "this process"
+            # Only if the keyword appears as a standalone phrase (not part of a link)
+            # and the replacement would be grammatically correct
+            idx = low.index(kw_lower)
+            # Ensure it's not inside a markdown link
+            before = stripped[:idx]
+            if before.count('[') > before.count(']'):
+                continue
+            # Don't replace if keyword is preceded by an article, adjective, or modifier
+            before_text = stripped[:idx].rstrip()
+            before_word = before_text.split()[-1].lower() if before_text else ""
+            if before_word in ("the", "a", "an", "your", "their", "our", "this", "that",
+                               "right", "is", "modern", "effective", "good", "better",
+                               "best", "poor", "strong", "robust", "solid", "proper",
+                               "basic", "simple", "advanced", "automated", "manual"):
+                continue  # "Modern this process" is ungrammatical
+            # Don't replace if followed by a noun that would make "this process X" awkward
+            after_kw = stripped[idx + len(keyword):].lstrip()
+            after_word = after_kw.split()[0].lower().rstrip(".,;:!?") if after_kw.split() else ""
+            if after_word in ("software", "system", "tool", "tools", "platform", "solution",
+                              "solutions", "program", "programs", "framework", "strategy"):
+                continue  # "this process software" is ungrammatical
+            # Capitalize at start of sentence, bullet, or numbered item
+            at_sentence_start = (
+                idx == 0
+                or (before_text and before_text[-1] in '.!?')
+                or (before_text and before_text.rstrip() in ('-', '*', '- ', '* '))
+                or bool(re.match(r'^(?:- |\* |\d+\.\s)', stripped))
+            )
+            replacement = "This process" if at_sentence_start else "this process"
+            new_stripped = stripped[:idx] + replacement + stripped[idx + len(keyword):]
+            lines[i] = lines[i].replace(stripped, new_stripped)
+            modified = True
+            removed += 1
+
+        return "\n".join(lines) if modified else None
+
+    def _dedup_existing_links(self, article: str) -> str:
+        """Remove duplicate link URLs already in the article from the writer.
+
+        Keeps the first occurrence of each URL; subsequent occurrences are
+        replaced with just the anchor text (link removed).
+        """
+        seen_urls: set[str] = set()
+        lines = article.split("\n")
+        any_changed = False
+        link_pattern = re.compile(r'\[([^\]]+)\]\((https?://[^)]+)\)')
+
+        for i, line in enumerate(lines):
+            new_line = line
+            offset = 0
+            line_changed = False
+
+            for m in link_pattern.finditer(line):
+                url = m.group(2).lower().rstrip("/")
+                if url in seen_urls:
+                    anchor = m.group(1)
+                    start = m.start() + offset
+                    end = m.end() + offset
+                    new_line = new_line[:start] + anchor + new_line[end:]
+                    offset += len(anchor) - (m.end() - m.start())
+                    line_changed = True
+                else:
+                    seen_urls.add(url)
+
+            if line_changed:
+                lines[i] = new_line
+                any_changed = True
+
+        return "\n".join(lines) if any_changed else article
+
     def _fix_keyword_in_intro(self, article: str, keyword: str) -> str | None:
         """Add keyword to the first paragraph if missing from first 100 words."""
         kw_lower = keyword.lower()
@@ -247,12 +404,14 @@ class SEOPassAgent(BaseAgent):
         # Find which URLs are already in the article
         existing_urls = set(u.lower() for _, u in re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', article))
 
-        # Get unused available links, filtering out blocked competitors
-        unused = [
-            l for l in available_links
-            if l.get("url", "").lower() not in existing_urls
-            and not is_blocked(l.get("url", ""))
-        ]
+        # Get unused available links, filtering out blocked competitors and deduplicating by URL
+        seen_urls: set[str] = set()
+        unused = []
+        for l in available_links:
+            url_lower = l.get("url", "").lower().rstrip("/")
+            if url_lower not in existing_urls and url_lower not in seen_urls and not is_blocked(l.get("url", "")):
+                seen_urls.add(url_lower)
+                unused.append(l)
         if not unused:
             return None
 
@@ -324,21 +483,32 @@ class SEOPassAgent(BaseAgent):
                     url = link.get("url", "")
                     if not url:
                         continue
-                    # Find an unlinked sentence containing "contract" + no existing link
+                    # Find an unlinked sentence containing topic-related phrases
+                    all_internal_phrases = [
+                        "contract lifecycle management",
+                        "contract risk management", "contract management",
+                        "risk management", "contract risk",
+                        "contract renewal", "contract compliance",
+                        "legal teams", "contract terms",
+                        "contract obligations", "contract deadlines",
+                        "contracts", "agreements", "renewals",
+                    ]
+                    placed = False
                     for i, line in enumerate(lines):
                         if i in self._global_modified_lines:
                             continue
                         stripped = line.strip()
                         if (not stripped or stripped.startswith("#")
-                                or stripped.startswith("|") or "](http" in stripped
+                                or stripped.startswith("|")
                                 or len(stripped) < 30):
                             continue
                         low = stripped.lower()
-                        # Wrap the first 2-3 word keyword phrase found
-                        for phrase in ["contract risk management", "contract management",
-                                       "risk management", "contract risk"]:
-                            if phrase in low:
+                        for phrase in all_internal_phrases:
+                            if phrase in low and f"[{phrase}" not in low:
                                 idx = low.index(phrase)
+                                before = stripped[:idx]
+                                if before.count('[') > before.count(']'):
+                                    continue
                                 original = stripped[idx:idx + len(phrase)]
                                 new_stripped = (
                                     stripped[:idx] + f"[{original}]({url})"
@@ -348,8 +518,121 @@ class SEOPassAgent(BaseAgent):
                                 modified = True
                                 current_internal += 1
                                 self._global_modified_lines.add(i)
+                                placed = True
                                 break
-                        if modified and current_internal >= 5:
+                        if placed:
+                            break
+                        if current_internal >= 5:
+                            break
+
+        # Fallback for external links: wrap topic-relevant phrases
+        if link_type == "external":
+            all_links_now = re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines))
+            current_external = len([(t, u) for t, u in all_links_now if "contractsafe.com" not in u.lower()])
+            if current_external < 3:
+                remaining_unused = [
+                    l for l in unused
+                    if l.get("url", "").lower() not in set(
+                        u.lower() for _, u in all_links_now
+                    )
+                ]
+                for link in remaining_unused:
+                    if current_external >= 3:
+                        break
+                    url = link.get("url", "")
+                    if not url:
+                        continue
+                    # Find an unlinked sentence containing topic-related terms
+                    for i, line in enumerate(lines):
+                        if i in self._global_modified_lines:
+                            continue
+                        stripped = line.strip()
+                        if (not stripped or stripped.startswith("#")
+                                or stripped.startswith("|") or "](http" in stripped
+                                or len(stripped) < 30):
+                            continue
+                        low = stripped.lower()
+                        # Wrap common topic phrases with external URLs
+                        # Try multi-word phrases first, then single-word fallbacks
+                        all_phrases = [
+                            "contract lifecycle management", "contract management",
+                            "risk management", "compliance management",
+                            "contract compliance", "compliance programs",
+                            "compliance risk", "legal operations",
+                            "procurement process", "vendor management",
+                            "legal teams", "contract terms",
+                            "business operations", "contract obligations",
+                        ]
+                        placed = False
+                        for phrase in all_phrases:
+                            if phrase in low and f"[{phrase}" not in low:
+                                idx = low.index(phrase)
+                                # Don't wrap if already inside a link
+                                before = stripped[:idx]
+                                if before.count('[') > before.count(']'):
+                                    continue
+                                original = stripped[idx:idx + len(phrase)]
+                                new_stripped = (
+                                    stripped[:idx] + f"[{original}]({url})"
+                                    + stripped[idx + len(phrase):]
+                                )
+                                lines[i] = line.replace(stripped, new_stripped)
+                                modified = True
+                                current_external += 1
+                                self._global_modified_lines.add(i)
+                                placed = True
+                                break
+                        if placed:
+                            break
+                    if current_external >= 3:
+                        break
+
+            # Last resort: if still short, try single-word anchors on any body line
+            if current_external < 3:
+                single_words = [
+                    "contracts", "agreements", "compliance", "procurement",
+                    "obligations", "renewals", "negotiations", "stakeholders",
+                ]
+                remaining_unused2 = [
+                    l for l in unused
+                    if l.get("url", "").lower() not in set(
+                        u.lower() for _, u in re.findall(
+                            r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines)
+                        )
+                    )
+                ]
+                for link in remaining_unused2:
+                    if current_external >= 3:
+                        break
+                    url = link.get("url", "")
+                    if not url:
+                        continue
+                    for i, line in enumerate(lines):
+                        if i in self._global_modified_lines:
+                            continue
+                        stripped = line.strip()
+                        if (not stripped or stripped.startswith("#")
+                                or stripped.startswith("|") or "](http" in stripped
+                                or len(stripped) < 30):
+                            continue
+                        low = stripped.lower()
+                        for word in single_words:
+                            if word in low and f"[{word}" not in low:
+                                idx = low.index(word)
+                                before = stripped[:idx]
+                                if before.count('[') > before.count(']'):
+                                    continue
+                                original = stripped[idx:idx + len(word)]
+                                new_stripped = (
+                                    stripped[:idx] + f"[{original}]({url})"
+                                    + stripped[idx + len(word):]
+                                )
+                                lines[i] = line.replace(stripped, new_stripped)
+                                modified = True
+                                current_external += 1
+                                self._global_modified_lines.add(i)
+                                break
+                        if current_external >= 3:
                             break
 
         return "\n".join(lines) if modified else None

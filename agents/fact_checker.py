@@ -204,16 +204,25 @@ class FactCheckerAgent(BaseAgent):
 
         return "UNVERIFIED", "No matching data found in research corpus"
 
+    # Pattern matching numbered step lines: "**1. Text", "**Step 1: Text", "1. Text"
+    _STEP_PATTERN = re.compile(r'^\*\*(?:Step\s*)?\d+[\.:]\s?|^\d+\.\s')
+
     def _is_only_body_of_step(self, lines: list[str], line_idx: int) -> bool:
         """Check if this line is the sole body paragraph of a numbered step.
 
         If removing it would leave a step heading with no body text, return True.
+        Also returns True if the line IS a step heading itself (e.g., "**Step 3: ...").
         """
+        stripped = lines[line_idx].strip()
+        # The line itself is a step heading — don't remove it
+        if self._STEP_PATTERN.match(stripped):
+            return True
+
         # Find previous non-blank line
         prev_is_step = False
         for j in range(line_idx - 1, max(line_idx - 4, -1), -1):
             if lines[j].strip():
-                prev_is_step = bool(re.match(r'^\*\*\d+\.', lines[j].strip()))
+                prev_is_step = bool(self._STEP_PATTERN.match(lines[j].strip()))
                 break
         if not prev_is_step:
             return False
@@ -221,16 +230,41 @@ class FactCheckerAgent(BaseAgent):
         for j in range(line_idx + 1, min(line_idx + 4, len(lines))):
             if lines[j].strip():
                 next_is_step_or_heading = bool(
-                    re.match(r'^\*\*\d+\.', lines[j].strip()) or lines[j].strip().startswith('#')
+                    self._STEP_PATTERN.match(lines[j].strip()) or lines[j].strip().startswith('#')
                 )
                 return next_is_step_or_heading
         return False
+
+    # Pattern for short commentary lines that are orphaned when an adjacent stat is removed
+    _ORPHAN_PATTERN = re.compile(
+        r"^(?:That's|That\u2019s|And yet|But this|So this|Remember |Here's|"
+        r"Here\u2019s|This is why|The reason|The point|What this means|"
+        r"Think about that|Let that sink|Sound familiar|Not exactly|"
+        r"That should)",
+        re.IGNORECASE,
+    )
+
+    def _clean_orphaned_neighbors(self, lines: list[str], removed_idx: int) -> None:
+        """After removing a stat line, check adjacent lines for orphaned commentary."""
+        for offset in (1, 2, -1, -2):
+            j = removed_idx + offset
+            if j < 0 or j >= len(lines):
+                continue
+            neighbor = lines[j].strip()
+            if not neighbor or neighbor.startswith("#"):
+                continue
+            # Short commentary line with no numbers that matches orphan patterns
+            if (len(neighbor.split()) < 25
+                    and self._ORPHAN_PATTERN.match(neighbor)
+                    and not re.search(r'\d+%|\$[\d,]+', neighbor)):
+                lines[j] = ""
 
     def _remove_unverified_claim(self, article: str, claim: str) -> tuple[str, bool]:
         """Remove an unverified claim from the article. Returns (revised_article, was_removed).
 
         Only removes if the claim contains a specific stat (number/percentage).
         Tries to remove just the sentence, not the whole paragraph.
+        Also cleans up adjacent orphaned commentary (e.g., "That's not a rounding error.").
         """
         # Only remove stats, not general attribution claims
         if not re.search(r'\d+%|\$[\d,]+|\d+\s*(billion|million|percent|times)', claim, re.IGNORECASE):
@@ -263,6 +297,7 @@ class FactCheckerAgent(BaseAgent):
                         overlap = len(meaningful_claim & line_words) / len(meaningful_claim)
                         if overlap > 0.6:  # Higher threshold to avoid removing wrong lines
                             removed = True
+                            self._clean_orphaned_neighbors(lines, li)
                             continue  # skip this line
                 new_lines.append(line)
             if removed:
@@ -280,6 +315,7 @@ class FactCheckerAgent(BaseAgent):
                     new_lines.append(line)
                     continue
                 removed = True
+                self._clean_orphaned_neighbors(lines, li)
                 continue
             new_lines.append(line)
         if removed:
