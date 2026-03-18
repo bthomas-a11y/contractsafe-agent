@@ -107,7 +107,13 @@ def serp_organic(
             })
 
         elif item_type == "people_also_ask":
-            for paa_item in item.get("items", [item]):
+            paa_items = item.get("items", [])
+            if not paa_items:
+                # Single PAA item at top level
+                paa_items = [item]
+            for paa_item in paa_items:
+                if not isinstance(paa_item, dict):
+                    continue
                 question = paa_item.get("title", "")
                 if question:
                     people_also_ask.append({
@@ -126,8 +132,10 @@ def serp_organic(
 
         elif item_type == "related_searches":
             for rs in item.get("items", []):
-                if rs.get("title"):
+                if isinstance(rs, dict) and rs.get("title"):
                     related_searches.append(rs["title"])
+                elif isinstance(rs, str) and rs:
+                    related_searches.append(rs)
 
     return {
         "organic": organic,
