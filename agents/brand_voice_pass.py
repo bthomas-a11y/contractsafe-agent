@@ -940,6 +940,20 @@ class BrandVoicePassAgent(BaseAgent):
                     self.log(f"[yellow]Cannot fix programmatically (manual review): {issue[:100]}[/yellow]")
 
             state.voice_issues_found = [{"issue": i[:80], "fix": "programmatic"} for i in issues]
+            # Enrich with detail: count corporate, transition, and repetitive fixes
+            corp_count = sum(1 for i in issues if "CORPORATE" in i or "B2B" in i)
+            trans_count = sum(1 for i in issues if "STIFF TRANSITION" in i)
+            rep_count = sum(1 for i in issues if "REPETITIVE" in i)
+            for entry in state.voice_issues_found:
+                iss = entry["issue"].upper()
+                if "CORPORATE" in iss or "B2B" in iss:
+                    entry["detail"] = f"Replaced corporate/B2B phrases ({corp_count} found)"
+                elif "STIFF TRANSITION" in iss:
+                    entry["detail"] = f"Replaced stiff transitions ({trans_count} found)"
+                elif "REPETITIVE" in iss:
+                    entry["detail"] = f"Fixed repetitive sentence starts ({rep_count} found)"
+                else:
+                    entry["detail"] = "Flagged for review"
             self.log(f"Applied {mechanical_count} mechanical + {creative_fixes} creative fixes (all programmatic).")
         else:
             state.voice_issues_found = []

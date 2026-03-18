@@ -51,7 +51,7 @@ class SEOPassAgent(BaseAgent):
                 self.log(f"  [yellow]- {issue[:100]}[/yellow]")
 
         state.seo_pass_article = article
-        state.seo_changes = [{"change": f, "reason": "programmatic"} for f in fixed]
+        state.seo_changes = fixed  # already list of dicts with change + detail
         self.log(f"SEO pass complete. {len(fixed)} programmatic fixes. {len(remaining)} remaining (manual review).")
         return state
 
@@ -59,71 +59,79 @@ class SEOPassAgent(BaseAgent):
     # PROGRAMMATIC FIXES — one method per issue type
     # ══════════════════════════════════════════════════════════════
 
-    def _apply_all_fixes(self, article: str, issues: list, state: PipelineState) -> tuple[str, list[str]]:
-        """Apply every possible programmatic fix. Returns (article, list_of_fix_names)."""
+    def _apply_all_fixes(self, article: str, issues: list, state: PipelineState) -> tuple[str, list[dict]]:
+        """Apply every possible programmatic fix. Returns (article, list_of_fix_dicts)."""
         fixed = []
         self._global_modified_lines = set()  # Track lines modified across all link-insertion calls
+
+        # Count links before fixes for detail reporting
+        internal_before = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', article))
+        external_before = len(re.findall(r'\[.*?\]\(https?://[^)]+\)', article)) - internal_before
 
         for issue in issues:
             if "KEYWORD NOT IN ANY H2" in issue:
                 result = self._fix_keyword_in_h2(article, state.target_keyword)
                 if result:
                     article = result
-                    fixed.append("keyword_in_h2")
+                    fixed.append({"change": "keyword_in_h2", "detail": f"Inserted '{state.target_keyword}' into an H2 heading"})
 
             elif "KEYWORD UNDERUSED" in issue:
                 result = self._fix_keyword_underuse(article, state.target_keyword)
                 if result:
                     article = result
-                    fixed.append("keyword_density")
+                    fixed.append({"change": "keyword_density", "detail": f"Added natural keyword mentions for '{state.target_keyword}'"})
 
             elif "KEYWORD MISSING FROM FIRST 100" in issue:
                 result = self._fix_keyword_in_intro(article, state.target_keyword)
                 if result:
                     article = result
-                    fixed.append("keyword_in_intro")
+                    fixed.append({"change": "keyword_in_intro", "detail": f"Added '{state.target_keyword}' to the introduction"})
 
             elif "MISSING SECONDARY KEYWORDS" in issue:
                 result = self._fix_secondary_keywords(article, state.secondary_keywords)
                 if result:
                     article = result
-                    fixed.append("secondary_keywords")
+                    fixed.append({"change": "secondary_keywords", "detail": f"Inserted secondary keywords: {', '.join(state.secondary_keywords[:5])}"})
 
             elif "INTERNAL LINKS" in issue and "ONLY" in issue:
                 result = self._fix_add_links(article, state.internal_links, "internal")
                 if result:
                     article = result
-                    fixed.append("add_internal_links")
+                    new_count = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', result))
+                    added = new_count - internal_before
+                    fixed.append({"change": "add_internal_links", "detail": f"Inserted {added} internal links to contractsafe.com pages"})
 
             elif "EXTERNAL LINKS" in issue and "ONLY" in issue:
                 result = self._fix_add_links(article, state.external_links, "external")
                 if result:
                     article = result
-                    fixed.append("add_external_links")
+                    new_ext = len(re.findall(r'\[.*?\]\(https?://[^)]+\)', result)) - len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', result))
+                    added = new_ext - external_before
+                    fixed.append({"change": "add_external_links", "detail": f"Inserted {added} external links to authoritative sources"})
 
             elif "LINKS NOT FRONT-LOADED" in issue:
                 result = self._fix_front_loading(article, state)
                 if result:
                     article = result
-                    fixed.append("link_front_loading")
+                    fixed.append({"change": "link_front_loading", "detail": "Redistributed links toward the first third of the article"})
 
             elif "NAKED URLs" in issue:
                 result = self._fix_naked_urls(article)
                 if result:
                     article = result
-                    fixed.append("naked_urls")
+                    fixed.append({"change": "naked_urls", "detail": "Wrapped bare URLs in markdown link syntax"})
 
             elif "GENERIC ANCHOR TEXT" in issue:
                 result = self._fix_generic_anchors(article)
                 if result:
                     article = result
-                    fixed.append("generic_anchors")
+                    fixed.append({"change": "generic_anchors", "detail": "Replaced generic anchor text ('click here', 'learn more') with descriptive text"})
 
             elif "KEYWORD STUFFING" in issue:
                 result = self._fix_keyword_overuse(article, state.target_keyword)
                 if result:
                     article = result
-                    fixed.append("keyword_destuffing")
+                    fixed.append({"change": "keyword_destuffing", "detail": f"Reduced overuse of '{state.target_keyword}'"})
 
         return article, fixed
 

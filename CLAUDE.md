@@ -63,6 +63,49 @@ When the pipeline finishes:
 - **"What topics have been generated?"** → `ls output/`
 - **"Re-run on the same topic"** → Delete the output folder first, then run fresh
 
+## Available Tools & Integrations
+
+You have these tools in this project. Use them when the user asks — don't reinvent the wheel.
+
+- **Google Drive** — Upload any DOCX as a Google Doc. `from tools.google_drive import upload_docx_to_drive; url = upload_docx_to_drive(docx_path, title)`. Uploads to "Claude Code articles" folder.
+- **Google Sheets** — Upload article sections to a spreadsheet. `from tools.google_sheets import upload_to_sheet`.
+- **HubSpot CMS** — Create draft blog posts. `from tools.hubspot_cms import create_blog_draft`. Also via `hubspot-cms` MCP server.
+- **Asana** — Search/update tasks, add comments. `from tools.asana_api import update_task, add_comment, search_tasks`. Also via `asana` MCP server.
+- **SEMrush** — Keyword research and domain analytics. Via `semrush` MCP server and `tools/semrush.py`.
+- **DOCX Export** — Convert markdown to Word. `from tools.docx_export import markdown_to_docx`.
+- **HTML Export** — Convert markdown to HTML. `from tools.html_export import markdown_to_html`.
+- **Web Search** — Tavily API. `from tools.web_search import search`.
+- **Web Fetch** — Fetch any webpage. `from tools.web_fetch import fetch_url`.
+- **Keyword Research** — Google Autocomplete + KeywordsPeopleUse. `from tools.keyword_research import full_keyword_research`.
+
+## After the Pipeline
+
+When the article is done:
+
+1. Show the validation score (e.g., "27/27 quality checks passed")
+2. Upload the DOCX to Google Drive: `from tools.google_drive import upload_docx_to_drive; url = upload_docx_to_drive(str(output_dir / "article.docx"), topic)` — share the link
+3. Show where files are (article.md, article.docx, linkedin_post.txt, twitter_post.txt, meta_description.txt)
+4. The `reports/` folder has stage-by-stage breakdowns — offer to show if the user wants to audit what was done:
+   - `reports/01_research.txt` — Sources, facts, statistics found
+   - `reports/02_keyword_strategy.txt` — SEMrush data, keyword volumes, PAA questions
+   - `reports/03_competitor_analysis.txt` — Top-ranking pages analyzed
+   - `reports/04_content_plan.txt` — Article structure and brief
+   - `reports/05_links.txt` — All internal/external links with verification status
+   - `reports/06_editing_changes.txt` — Brand voice, fact-check, SEO, and AEO changes
+5. Offer to show any of these: "Want me to show you the article, the LinkedIn post, or the research reports?"
+
+## Handling Non-Technical Users
+
+- **"Can you help me with content?"** / **"I need a blog post"** → Ask for a topic, then run the pipeline
+- **"What can you do?"** / **"How does this work?"** → Explain: give me a topic and I'll write a fully optimized blog post with SEO, links, and social copy in about 6 minutes
+- **"Upload to Drive"** / **"Put this in Google Drive"** → Use `tools/google_drive.upload_docx_to_drive()`
+- **"Show me the research"** / **"What keywords did you find?"** → Read from `output/<slug>/reports/`
+- **"Send to HubSpot"** / **"Publish this"** → Use `tools/hubspot_cms.create_blog_draft()`
+- **"Update Asana"** / **"Mark the task done"** → Use `tools/asana_api`
+- **"Open the file"** → Can't open applications. Show the content inline or tell them the file path.
+- **If the user seems confused** → Ask one simple clarifying question. Don't dump technical details.
+- Never say "check the logs", mention pipeline_state.json, agent numbers, or model names
+
 ## If Something Goes Wrong
 
 - If the pipeline errors, read the last 20 lines of output to diagnose

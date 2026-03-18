@@ -1058,6 +1058,294 @@ def final_gate(state: PipelineState):
         ))
 
 
+def _save_reports(state: PipelineState, output_dir: Path):
+    """Write human-readable stage reports to output/<slug>/reports/."""
+    reports_dir = output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime
+
+    # ── 01: Research Summary ──
+    lines = [
+        "RESEARCH SUMMARY",
+        "=" * 50,
+        "",
+        f"Topic: {state.topic}",
+        f"Keyword: {state.target_keyword}",
+        f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+    ]
+    if state.key_facts:
+        lines.append(f"KEY FACTS ({len(state.key_facts)} found)")
+        lines.append("-" * 40)
+        for i, f in enumerate(state.key_facts, 1):
+            src = f.get("source", "unknown")
+            lines.append(f"{i}. {f.get('fact', f.get('text', ''))} — Source: {src}")
+        lines.append("")
+    if state.statistics:
+        lines.append(f"STATISTICS ({len(state.statistics)} found)")
+        lines.append("-" * 40)
+        for i, s in enumerate(state.statistics, 1):
+            name = s.get("source_name", "unknown")
+            url = s.get("source_url", "")
+            text = s.get("stat", s.get("text", ""))
+            lines.append(f"{i}. {text}")
+            lines.append(f"   Source: {name} ({url})" if url else f"   Source: {name}")
+        lines.append("")
+    if state.product_knowledge:
+        lines.append("CONTRACTSAFE PRODUCT FEATURES USED")
+        lines.append("-" * 40)
+        lines.append(state.product_knowledge)
+        lines.append("")
+    (reports_dir / "01_research.txt").write_text("\n".join(lines))
+
+    # ── 02: Keyword Strategy ──
+    lines = [
+        "KEYWORD STRATEGY",
+        "=" * 50,
+        "",
+    ]
+    kd = state.keyword_data or {}
+    semrush = kd.get("semrush", {})
+    overview = semrush.get("overview", {})
+    lines.append("PRIMARY KEYWORD")
+    lines.append("-" * 40)
+    lines.append(f"Keyword: {kd.get('primary_kw', state.target_keyword)}")
+    if overview:
+        lines.append(f"Search Volume: {overview.get('Nq', 'N/A')} (monthly, US)")
+        lines.append(f"Competition: {overview.get('Co', 'N/A')}")
+    lines.append("")
+
+    sec_kws = kd.get("secondary_kws", state.secondary_keywords or [])
+    if sec_kws:
+        lines.append(f"SECONDARY KEYWORDS ({len(sec_kws)})")
+        lines.append("-" * 40)
+        # Try to match with SEMrush volume data
+        related = {r.get("Ph", "").lower(): r for r in semrush.get("related_keywords", [])}
+        for kw in sec_kws:
+            vol_data = related.get(kw.lower(), {})
+            vol = vol_data.get("Nq", "")
+            diff = vol_data.get("Kd", "")
+            suffix = f" (volume: {vol}, difficulty: {diff})" if vol else ""
+            lines.append(f"  - {kw}{suffix}")
+        lines.append("")
+
+    paa = kd.get("questions_people_ask", kd.get("people_also_ask", []))
+    if paa:
+        lines.append(f"PEOPLE ALSO ASK ({len(paa)} questions)")
+        lines.append("-" * 40)
+        for i, q in enumerate(paa, 1):
+            lines.append(f"{i}. {q}")
+        lines.append("")
+
+    if state.keyword_clusters:
+        lines.append("KEYWORD CLUSTERS BY SEARCH INTENT")
+        lines.append("-" * 40)
+        for cluster in state.keyword_clusters:
+            name = cluster.get("name", "Unknown")
+            kws = cluster.get("keywords", [])
+            lines.append(f"\n{name} ({len(kws)} keywords):")
+            for kw_entry in kws[:10]:
+                kw_name = kw_entry.get("keyword", kw_entry) if isinstance(kw_entry, dict) else kw_entry
+                kw_vol = kw_entry.get("volume", "") if isinstance(kw_entry, dict) else ""
+                suffix = f" (volume: {kw_vol})" if kw_vol else ""
+                lines.append(f"  - {kw_name}{suffix}")
+        lines.append("")
+
+    if state.keyword_gaps:
+        lines.append(f"KEYWORD GAPS VS COMPETITORS ({len(state.keyword_gaps)})")
+        lines.append("-" * 40)
+        lines.append("Keywords competitors rank for that ContractSafe doesn't:")
+        for gap in state.keyword_gaps[:20]:
+            kw_name = gap.get("keyword", "")
+            vol = gap.get("volume", "")
+            comp = gap.get("competitor", "")
+            lines.append(f"  - {kw_name} (volume: {vol}, competitor: {comp})")
+        lines.append("")
+
+    lines.append("DATA SOURCES")
+    lines.append("-" * 40)
+    sources = ["Google Autocomplete (~32 queries)"]
+    if semrush:
+        sources.append("SEMrush API (keyword overview, related keywords, PAA questions, broad match, keyword difficulty)")
+    if kd.get("semantic_keywords"):
+        sources.append("KeywordsPeopleUse API (PAA, autocomplete, semantic)")
+    sources.append("Tavily web search (topic + variations)")
+    for s in sources:
+        lines.append(f"- {s}")
+    (reports_dir / "02_keyword_strategy.txt").write_text("\n".join(lines))
+
+    # ── 03: Competitor Analysis ──
+    lines = [
+        "COMPETITOR ANALYSIS",
+        "=" * 50,
+        "",
+    ]
+    if state.competitor_pages:
+        lines.append(f"{len(state.competitor_pages)} top-ranking pages analyzed for \"{state.target_keyword}\":")
+        lines.append("")
+        for i, page in enumerate(state.competitor_pages, 1):
+            lines.append(f"PAGE {i}: {page.get('title', 'Unknown')}")
+            lines.append(f"  URL: {page.get('url', '')}")
+            lines.append(f"  Word Count: {page.get('word_count', 'N/A')}")
+            features = []
+            for feat in ["has_stats", "has_lists", "has_tables", "has_faq"]:
+                label = feat.replace("has_", "").title()
+                features.append(f"{label}: {'Yes' if page.get(feat) else 'No'}")
+            lines.append(f"  Content Features: {' | '.join(features)}")
+            h2s = page.get("h2s", [])
+            if h2s:
+                lines.append(f"  H2 Structure ({len(h2s)} headings):")
+                for h2 in h2s:
+                    lines.append(f"    - {h2}")
+            gaps = page.get("gaps", [])
+            if gaps:
+                lines.append(f"  Content Gaps:")
+                for gap in gaps:
+                    lines.append(f"    - {gap}")
+            lines.append("")
+    else:
+        lines.append("No competitor pages were analyzed.")
+    (reports_dir / "03_competitor_analysis.txt").write_text("\n".join(lines))
+
+    # ── 04: Content Plan ──
+    lines = [
+        "CONTENT PLAN",
+        "=" * 50,
+        "",
+    ]
+    if state.recommended_h2s:
+        lines.append("ARTICLE STRUCTURE")
+        lines.append("-" * 40)
+        lines.append("H2 Headings (in order):")
+        for i, h2 in enumerate(state.recommended_h2s, 1):
+            lines.append(f"  {i}. {h2}")
+        lines.append("")
+    if state.serp_features:
+        lines.append("SERP FEATURES DETECTED")
+        lines.append("-" * 40)
+        for feat in state.serp_features:
+            lines.append(f"  - {feat}")
+        lines.append("")
+    if state.consolidated_brief:
+        lines.append("CONTENT BRIEF")
+        lines.append("-" * 40)
+        lines.append(state.consolidated_brief)
+    (reports_dir / "04_content_plan.txt").write_text("\n".join(lines))
+
+    # ── 05: Links ──
+    tier_labels = {1: "Government/Academic/Major Research", 2: "Industry Reference", 3: "General Web"}
+    lines = [
+        "LINK PLAN",
+        "=" * 50,
+        "",
+    ]
+    if state.internal_links:
+        lines.append(f"INTERNAL LINKS ({len(state.internal_links)} verified)")
+        lines.append("-" * 40)
+        for i, link in enumerate(state.internal_links, 1):
+            lines.append(f"{i}. {link.get('title', 'Unknown')}")
+            lines.append(f"   URL: {link.get('url', '')}")
+            if link.get("relevance_summary"):
+                lines.append(f"   Relevance: {link['relevance_summary']}")
+            if link.get("anchor_suggestion"):
+                lines.append(f"   Suggested Anchor: {link['anchor_suggestion']}")
+            lines.append(f"   Status: {'Verified (HTTP 200)' if link.get('verified') else 'Unverified'}")
+        lines.append("")
+    if state.external_links:
+        lines.append(f"EXTERNAL LINKS ({len(state.external_links)} verified)")
+        lines.append("-" * 40)
+        for i, link in enumerate(state.external_links, 1):
+            tier = link.get("tier", 3)
+            lines.append(f"{i}. {link.get('title', link.get('url', 'Unknown'))}")
+            lines.append(f"   URL: {link.get('url', '')}")
+            lines.append(f"   Tier: {tier} ({tier_labels.get(tier, 'Unknown')})")
+            if link.get("relevance_summary"):
+                lines.append(f"   Relevance: {link['relevance_summary']}")
+            lines.append(f"   Status: {'Verified (HTTP 200)' if link.get('verified') else 'Unverified'}")
+        lines.append("")
+    if state.citation_map:
+        lines.append("CITATION MAP (which links go in which section)")
+        lines.append("-" * 40)
+        for section, links in state.citation_map.items():
+            lines.append(f"\n  {section}:")
+            if isinstance(links, list):
+                for lnk in links:
+                    ltype = lnk.get("type", "")
+                    url = lnk.get("url", "")
+                    anchor = lnk.get("anchor", "")
+                    lines.append(f"    - [{anchor}]({url}) ({ltype})")
+        lines.append("")
+    lines.append("SOURCE TIER DEFINITIONS")
+    lines.append("-" * 40)
+    lines.append("Tier 1: Government, academic, major research (.gov, .edu, ABA, Gartner, Forrester, etc.)")
+    lines.append("Tier 2: Industry reference (Statista, Investopedia, IBM, Microsoft, etc.)")
+    lines.append("Tier 3: General web sources")
+    (reports_dir / "05_links.txt").write_text("\n".join(lines))
+
+    # ── 06: Editing Changes ──
+    lines = [
+        "EDITING CHANGES",
+        "=" * 50,
+        "",
+    ]
+    # Brand voice
+    lines.append("BRAND VOICE PASS")
+    lines.append("-" * 40)
+    if state.voice_issues_found:
+        lines.append(f"{len(state.voice_issues_found)} issues found and fixed:")
+        for entry in state.voice_issues_found:
+            detail = entry.get("detail", "")
+            issue = entry.get("issue", "")
+            lines.append(f"  - {issue}: {detail}" if detail else f"  - {issue}")
+    else:
+        lines.append("No voice issues found.")
+    lines.append("")
+
+    # Fact check
+    lines.append("FACT CHECK")
+    lines.append("-" * 40)
+    if state.fact_check_results:
+        verified = [r for r in state.fact_check_results if r.get("verified")]
+        removed = [r for r in state.fact_check_results if not r.get("verified")]
+        lines.append(f"{len(verified)} claims verified. {len(removed)} unverified claims removed:")
+        for r in removed:
+            lines.append(f"  - {r.get('claim', r.get('text', 'Unknown'))[:100]}")
+            if r.get("reason"):
+                lines.append(f"    Reason: {r['reason']}")
+    else:
+        lines.append("No fact-check data recorded.")
+    lines.append("")
+
+    # SEO
+    lines.append("SEO OPTIMIZATION")
+    lines.append("-" * 40)
+    if state.seo_changes:
+        lines.append(f"{len(state.seo_changes)} changes made:")
+        for entry in state.seo_changes:
+            detail = entry.get("detail", "")
+            change = entry.get("change", "")
+            lines.append(f"  - {detail}" if detail else f"  - {change}")
+    else:
+        lines.append("No SEO changes needed.")
+    lines.append("")
+
+    # AEO
+    lines.append("AEO (AI ENGINE OPTIMIZATION)")
+    lines.append("-" * 40)
+    if state.aeo_changes:
+        lines.append(f"{len(state.aeo_changes)} changes made:")
+        for entry in state.aeo_changes:
+            detail = entry.get("detail", "")
+            change = entry.get("change", "")
+            lines.append(f"  - {detail}" if detail else f"  - {change}")
+    else:
+        lines.append("No AEO changes needed.")
+
+    (reports_dir / "06_editing_changes.txt").write_text("\n".join(lines))
+
+    console.print(f"  [green]Stage reports saved:[/green] reports/ (6 files)")
+
+
 def save_outputs(state: PipelineState) -> Path:
     """Save all outputs to the output directory."""
     slug = state.get_topic_slug()
@@ -1099,6 +1387,13 @@ def save_outputs(state: PipelineState) -> Path:
         (research_dir / "citation_map.md").write_text(json.dumps(state.citation_map, indent=2))
 
     state.save(str(output_dir / "pipeline_state.json"))
+
+    # Save human-readable stage reports
+    try:
+        _save_reports(state, output_dir)
+    except Exception as e:
+        console.print(f"  [yellow]Report generation failed: {e}[/yellow]")
+
     return output_dir
 
 

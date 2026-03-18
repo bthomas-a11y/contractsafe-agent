@@ -59,7 +59,7 @@ class AEOPassAgent(BaseAgent):
                 self.log(f"  - {iss[:80]}")
 
         state.aeo_pass_article = article
-        state.aeo_changes = [{"change": f} for f in fixed]
+        state.aeo_changes = fixed  # already list of dicts with change + detail
 
         word_count = len(article.split())
         self.log(
@@ -72,7 +72,7 @@ class AEOPassAgent(BaseAgent):
 
     def _apply_all_fixes(
         self, article: str, issues: list, state: PipelineState
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[dict]]:
         """Apply all programmatic AEO fixes."""
         fixed = []
 
@@ -81,67 +81,67 @@ class AEOPassAgent(BaseAgent):
                 result = self._fix_vague_headings(article, issue, state)
                 if result:
                     article = result
-                    fixed.append("vague_headings")
+                    fixed.append({"change": "vague_headings", "detail": "Replaced vague headings with keyword-rich, self-describing headings"})
 
             elif "ENTITY CLARITY" in issue:
                 result = self._fix_entity_clarity(article)
                 if result:
                     article = result
-                    fixed.append("entity_clarity")
+                    fixed.append({"change": "entity_clarity", "detail": "Added context to first ContractSafe mention (', a contract management software platform,')"})
 
             elif "NO FRESHNESS SIGNALS" in issue:
                 result = self._fix_freshness(article)
                 if result:
                     article = result
-                    fixed.append("freshness")
+                    fixed.append({"change": "freshness", "detail": f"Added current year reference ({datetime.datetime.now().year})"})
 
             elif "SOURCE ATTRIBUTION" in issue:
                 result = self._fix_source_attribution(article, state)
                 if result:
                     article = result
-                    fixed.append("source_attribution")
+                    fixed.append({"change": "source_attribution", "detail": "Added 'according to [source]' attribution to unattributed statistics"})
 
             elif "LOW DATA DENSITY" in issue:
                 result = self._fix_data_density(article, state)
                 if result:
                     article = result
-                    fixed.append("data_density")
+                    fixed.append({"change": "data_density", "detail": "Inserted additional statistics from research to increase quantifiable claims density"})
 
             elif "CONTEXT-DEPENDENT" in issue:
                 result = self._fix_context_dependent(article)
                 if result:
                     article = result
-                    fixed.append("context_dependent")
+                    fixed.append({"change": "context_dependent", "detail": "Rewrote context-dependent passages ('this is why...', 'as mentioned...') to be self-contained"})
 
             elif "PAA QUESTIONS" in issue:
                 result = self._fix_paa_coverage(article, issue, state)
                 if result:
                     article = result
-                    fixed.append("paa_coverage")
+                    fixed.append({"change": "paa_coverage", "detail": "Added FAQ section covering unanswered People Also Ask questions"})
 
             elif "ANSWER BLOCKS MISSING" in issue:
                 result = self._fix_answer_blocks(article, issue, state)
                 if result:
                     article = result
-                    fixed.append("answer_blocks")
+                    fixed.append({"change": "answer_blocks", "detail": "Added direct answer sentences after H2 headings for AI extractability"})
 
             elif "PROCESS SECTIONS" in issue:
                 result = self._fix_process_sections(article)
                 if result:
                     article = result
-                    fixed.append("process_sections")
+                    fixed.append({"change": "process_sections", "detail": "Converted narrative process content to numbered steps"})
 
             elif "SEMANTIC TRIPLES" in issue:
                 result = self._fix_semantic_triples(article, state)
                 if result:
                     article = result
-                    fixed.append("semantic_triples")
+                    fixed.append({"change": "semantic_triples", "detail": "Added ContractSafe subject-verb-object statements for entity recognition"})
 
             elif "UNIQUE VALUE" in issue:
                 result = self._fix_unique_value(article, state)
                 if result:
                     article = result
-                    fixed.append("unique_value")
+                    fixed.append({"change": "unique_value", "detail": "Added unique value signal (ContractSafe Industry Report reference)"})
 
         return article, fixed
 
