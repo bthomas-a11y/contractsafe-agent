@@ -14,7 +14,7 @@ from tools.semrush import (
     batch_keyword_overview as semrush_batch,
     domain_organic_keywords as semrush_domain_kws,
 )
-from tools.dataforseo import serp_organic as dataforseo_serp
+from tools.dataforseo import serp_organic as dataforseo_serp, query_fanout_citability
 from config import SEMRUSH_API_KEY, DATAFORSEO_LOGIN
 
 
@@ -68,6 +68,27 @@ class SEOResearcherAgent(BaseAgent):
         existing_questions = state.keyword_data.get("questions_people_ask", [])
         dataforseo_paa = state.keyword_data.get("dataforseo_paa", [])
         all_questions = list(dict.fromkeys(dataforseo_paa + existing_questions + extra_questions))
+
+        # --- AI Overview citability analysis (query fanout) ---
+        if DATAFORSEO_LOGIN and dataforseo_data and dataforseo_data.get("organic"):
+            self.progress("Running AI Overview citability analysis (query fanout)...")
+            paa_for_fanout = [q["question"] for q in dataforseo_data.get("people_also_ask", [])][:4]
+            related_for_fanout = dataforseo_data.get("related_searches", [])[:4]
+            citability = query_fanout_citability(
+                target_keyword=state.target_keyword,
+                paa_questions=paa_for_fanout,
+                related_searches=related_for_fanout,
+            )
+            state.citability_analysis = citability
+            if citability.get("queries_with_ai_overview", 0) > 0:
+                top_domains = ", ".join(d["domain"] for d in citability.get("top_cited_domains", [])[:3])
+                self.progress(
+                    f"Citability: {citability['queries_with_ai_overview']}/{citability['queries_analyzed']} "
+                    f"queries have AI Overviews. ContractSafe cited: {citability['our_domain_cited']}. "
+                    f"Top cited: {top_domains}"
+                )
+            else:
+                self.progress("Citability: No AI Overviews found for this query fanout")
 
         # --- SEMrush data (read from Agent 3's state, not re-fetched) ---
         semrush_section = ""
@@ -379,7 +400,7 @@ class SEOResearcherAgent(BaseAgent):
         gap_keywords.sort(key=lambda x: int(x["volume"]) if str(x["volume"]).isdigit() else 0, reverse=True)
         return gap_keywords[:30]
 
-    def _detect_serp_features(self, serp_results: list[dict], dataforseo_data: dict | None = None) -> list[str]:
+    def _detect_serp_features(self, serp_results: list[dict], dataforseo_data=None) -> list[str]:
         """Detect SERP features from search results.
 
         When DataForSEO data is available, uses actual item_types for precise
@@ -503,6 +524,24 @@ class SEOResearcherAgent(BaseAgent):
             sections.append("## Keyword Gap Opportunities")
             for gap in state.keyword_gaps[:10]:
                 sections.append(f"- {gap['keyword']} (vol: {gap.get('volume', 'N/A')}, competitor: {gap.get('competitor', '')})")
+            sections.append("")
+
+        # AI Overview citability
+        ca = state.citability_analysis
+        if ca and ca.get("queries_with_ai_overview", 0) > 0:
+            sections.append("## AI Overview Citability Analysis")
+            sections.append(f"**{ca['queries_with_ai_overview']}/{ca['queries_analyzed']}** queries have AI Overviews.")
+            sections.append(f"**ContractSafe cited:** {'Yes' if ca['our_domain_cited'] else 'No'}")
+            if ca.get("top_cited_domains"):
+                sections.append("\n**Top Cited Domains:**")
+                for d in ca["top_cited_domains"][:5]:
+                    sections.append(f"- {d['domain']}: {d['count']} citations")
+            cp = ca.get("citation_patterns", {})
+            if any(cp.values()):
+                sections.append("\n**Citation Patterns in AI Overviews:**")
+                for k, v in cp.items():
+                    if v > 0:
+                        sections.append(f"- {k.replace('_', ' ').title()}: {v}")
             sections.append("")
 
         # Competitor analysis

@@ -498,6 +498,91 @@ class FinalValidatorAgent(BaseAgent):
         checks.append(("AEO Unique Value", has_unique_content,
                        "Unique content signals found" if has_unique_content else "No proprietary/original content (strategic gap)"))
 
+        # ── 28. Citability Pattern Score (soft — does not fail pipeline) ──
+        ca = getattr(state, 'citability_analysis', None) or {}
+        if ca and ca.get("queries_with_ai_overview", 0) > 0:
+            cp = ca.get("citation_patterns", {})
+            c_matched = 0
+            c_total = 0
+            if cp.get("definition_blocks", 0) >= 2:
+                c_total += 1
+                if len(re.findall(r'(?:^|\n)[A-Z][^.\n]*\b(?:is|are|refers to)\b[^.\n]+\.', article)) >= 2:
+                    c_matched += 1
+            if cp.get("bold_label_lists", 0) >= 2:
+                c_total += 1
+                if len(re.findall(r'^\*\*[^*]+\*\*:?\s+\S', article, re.MULTILINE)) >= 3:
+                    c_matched += 1
+            if cp.get("numbered_steps", 0) >= 2:
+                c_total += 1
+                if len(re.findall(r'^\d+\.\s+', article, re.MULTILINE)) >= 3:
+                    c_matched += 1
+            if cp.get("data_backed_claims", 0) >= 2:
+                c_total += 1
+                sourced = [l for l in article.split('\n') if re.search(r'\d+%', l) and
+                           any(p in l.lower() for p in ["according to", "reports", "found that"])]
+                if len(sourced) >= 2:
+                    c_matched += 1
+            if c_total > 0:
+                c_pct = c_matched / c_total * 100
+                checks.append(("Citability Pattern Score", True,  # soft check — always passes
+                               f"{c_matched}/{c_total} patterns matched ({c_pct:.0f}%)"))
+            else:
+                checks.append(("Citability Pattern Score", True, "No dominant patterns to match"))
+        else:
+            checks.append(("Citability Pattern Score", True, "No citability data (DataForSEO not configured)"))
+
+        # ── 29. Query Fanout Coverage (soft — does not fail pipeline) ──
+        if ca and ca.get("per_query_results"):
+            article_lower = article.lower()
+            qf_coverable = 0
+            qf_covered = 0
+            for qr in ca["per_query_results"]:
+                if not qr.get("has_ai_overview"):
+                    continue
+                qf_coverable += 1
+                qw = set(w.lower() for w in qr["query"].split() if len(w) > 3)
+                qw -= {"what", "does", "which", "where", "when", "that", "this", "have", "with"}
+                cov = sum(1 for w in qw if w in article_lower) / max(len(qw), 1)
+                if cov > 0.5:
+                    qf_covered += 1
+            if qf_coverable > 0:
+                qf_pct = qf_covered / qf_coverable * 100
+                checks.append(("Query Fanout Coverage", True,  # soft check
+                               f"{qf_covered}/{qf_coverable} sub-queries addressed ({qf_pct:.0f}%)"))
+            else:
+                checks.append(("Query Fanout Coverage", True, "No AI Overviews in sub-queries"))
+        else:
+            checks.append(("Query Fanout Coverage", True, "No fanout data available"))
+
+        # ── 30. Definition Extractability ──
+        def_h2_kws = ["what is", "what are", "definition", "overview", "understanding"]
+        h2_lines_all = [l.strip() for l in article.split('\n') if l.strip().startswith('## ')]
+        de_extractable = 0
+        de_total = 0
+        for h2_line in h2_lines_all:
+            h2_text = h2_line[3:].strip()
+            if not any(k in h2_text.lower() for k in def_h2_kws):
+                continue
+            de_total += 1
+            h2_pos = article.find(h2_line)
+            if h2_pos >= 0:
+                section_lines = article[h2_pos:].split('\n')[1:8]
+                for sl in section_lines:
+                    sl = sl.strip()
+                    if not sl or sl.startswith('#') or sl.startswith('|') or sl.startswith('-'):
+                        continue
+                    if re.match(r'^[A-Z][^.]*\b(?:is|are|refers to|means)\b[^.]+\.', sl):
+                        de_extractable += 1
+                    break
+        if de_total > 0:
+            de_passed = de_extractable == de_total
+            checks.append(("Definition Extractability", de_passed,
+                           f"{de_extractable}/{de_total} definition sections in extractable format"))
+            if not de_passed:
+                overall_pass = False
+        else:
+            checks.append(("Definition Extractability", True, "No definition sections detected"))
+
         # ── Build report ──
         report_lines = ["# Final Validation Report\n"]
         pass_count = sum(1 for _, p, _ in checks if p)

@@ -39,6 +39,7 @@ class PipelineState:
     recommended_h2s: list[str] = field(default_factory=list)
     keyword_clusters: list[dict] = field(default_factory=list)  # SEMrush: groups of related keywords by intent
     keyword_gaps: list[dict] = field(default_factory=list)  # SEMrush: keywords competitors rank for that we don't
+    citability_analysis: dict = field(default_factory=dict)  # DataForSEO: AI Overview citation patterns across query fanout
 
     # --- Agent 5: Link Research ---
     internal_links: list[dict] = field(default_factory=list)

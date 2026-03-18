@@ -154,6 +154,30 @@ class BriefConsolidatorAgent(BaseAgent):
                 sections.append(f"- {f}")
             sections.append("")
 
+        # ── AI Citability Intelligence ──
+        ca = state.citability_analysis
+        if ca and ca.get("queries_with_ai_overview", 0) > 0:
+            sections.append("## AI Citability Intelligence")
+            sections.append("*Google AI Overviews exist for this topic. Structure content to be citable:*\n")
+
+            cp = ca.get("citation_patterns", {})
+            if cp.get("definition_blocks", 0) >= 2:
+                sections.append("- **Start key sections with definitions:** Use 'X is a [concise definition].' format in the first sentence after each H2.")
+            if cp.get("bold_label_lists", 0) >= 2:
+                sections.append("- **Use bold-label lists:** Format feature/benefit sections as '**Feature:** Description' bullets.")
+            if cp.get("numbered_steps", 0) >= 2:
+                sections.append("- **Use numbered steps** for process/how-to sections.")
+            if cp.get("data_backed_claims", 0) >= 1:
+                sections.append("- **Include sourced statistics** inline with named sources (e.g., 'According to Deloitte, ...').")
+
+            if not ca.get("our_domain_cited"):
+                top = ca.get("top_cited_domains", [])[:3]
+                if top:
+                    domains = ", ".join(d["domain"] for d in top)
+                    sections.append(f"\n**Competitive gap:** ContractSafe is NOT cited in AI Overviews. Currently cited: {domains}.")
+                    sections.append("Write definitive, extractable answers that are more specific and better sourced than these competitors.")
+            sections.append("")
+
         # ── Keyword Clusters (from SEMrush) ──
         if state.keyword_clusters:
             sections.append("## Keyword Clusters to Target")

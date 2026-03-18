@@ -143,6 +143,18 @@ class AEOPassAgent(BaseAgent):
                     article = result
                     fixed.append({"change": "unique_value", "detail": "Added unique value signal (ContractSafe Industry Report reference)"})
 
+            elif "DEFINITION EXTRACTABILITY" in issue:
+                result = self._fix_definition_extractability(article, state)
+                if result:
+                    article = result
+                    fixed.append({"change": "definition_extractability", "detail": "Restructured definition sections into AI-extractable 'X is [definition]' format"})
+
+            elif "CITABILITY PATTERN MATCH" in issue:
+                result = self._fix_citability_patterns(article, state)
+                if result:
+                    article = result
+                    fixed.append({"change": "citability_patterns", "detail": "Converted bullet lists to bold-label format matching AI Overview citation patterns"})
+
         return article, fixed
 
     # ── Individual fix methods ──
@@ -959,6 +971,69 @@ class AEOPassAgent(BaseAgent):
 
     # ── Programmatic AEO audit ──
 
+    def _fix_definition_extractability(self, article: str, state: PipelineState) -> str | None:
+        """Restructure opening sentences of definition sections into 'X is [definition]' format."""
+        import re as _re
+        lines = article.split("\n")
+        kw = state.target_keyword
+        kw_title = kw.title()
+        modified = False
+
+        definition_h2_keywords = ["what is", "what are", "definition", "overview", "understanding"]
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("## "):
+                continue
+            h2_lower = stripped[3:].strip().lower()
+            if not any(k in h2_lower for k in definition_h2_keywords):
+                continue
+
+            # Find first non-empty prose paragraph
+            for j in range(i + 1, min(i + 8, len(lines))):
+                first_para = lines[j].strip()
+                if not first_para or first_para.startswith('#') or first_para.startswith('|') or first_para.startswith('-'):
+                    continue
+                # Already extractable?
+                if _re.match(r'^[A-Z][^.]*\b(?:is|are|refers to|means)\b', first_para):
+                    break
+                # Restructure: prepend "Keyword is/are" to the existing content
+                first_sentence_end = first_para.find('.')
+                if first_sentence_end > 10:
+                    existing = first_para[:first_sentence_end + 1]
+                    rest = first_para[first_sentence_end + 1:].strip()
+                    new_first = f"{kw_title} is {existing[0].lower()}{existing[1:]}"
+                    lines[j] = (new_first + " " + rest).strip()
+                    modified = True
+                break
+
+        return "\n".join(lines) if modified else None
+
+    def _fix_citability_patterns(self, article: str, state: PipelineState) -> str | None:
+        """Convert plain bullets to bold-label format when AI Overviews favor that structure."""
+        import re as _re
+        ca = getattr(state, 'citability_analysis', None) or {}
+        cp = ca.get("citation_patterns", {})
+
+        if cp.get("bold_label_lists", 0) < 2:
+            return None
+
+        lines = article.split("\n")
+        modified = False
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Find plain bullets with a colon separator but no bold
+            if stripped.startswith("- ") and ":" in stripped[2:40] and "**" not in stripped:
+                colon_pos = stripped.index(":", 2)
+                label = stripped[2:colon_pos].strip()
+                rest = stripped[colon_pos + 1:].strip()
+                if label and rest and 1 <= len(label.split()) <= 5:
+                    lines[i] = f"- **{label}:** {rest}"
+                    modified = True
+
+        return "\n".join(lines) if modified else None
+
     def _audit(self, article: str, state: PipelineState) -> dict:
         """Run mechanical AEO checks. All checks are programmatic."""
         issues = []
@@ -1283,6 +1358,110 @@ class AEOPassAgent(BaseAgent):
             f"- Unique Value: {'PASS' if has_unique else 'FLAG'} "
             f"({'Unique content signals found' if has_unique else 'No proprietary content detected'})"
         )
+
+        # ── 12. Definition Extractability ──
+        definition_h2_kws = ["what is", "what are", "definition", "overview", "understanding"]
+        def_extractable = 0
+        def_total = 0
+        for line_idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("## "):
+                continue
+            h2_lower = stripped[3:].strip().lower()
+            if not any(k in h2_lower for k in definition_h2_kws):
+                continue
+            def_total += 1
+            for j in range(line_idx + 1, min(line_idx + 8, len(lines))):
+                s = lines[j].strip()
+                if not s or s.startswith('#') or s.startswith('|') or s.startswith('-'):
+                    continue
+                if re.match(r'^[A-Z][^.]*\b(?:is|are|refers to|means)\b[^.]+\.', s):
+                    def_extractable += 1
+                break
+        if def_total > 0 and def_extractable < def_total:
+            issues.append(
+                f"DEFINITION EXTRACTABILITY: {def_extractable}/{def_total} definition sections "
+                f"start with extractable 'X is/are [definition]' format."
+            )
+        scorecard_lines.append(
+            f"- Definition Extractability: {'PASS' if def_total == 0 or def_extractable == def_total else 'FAIL'} "
+            f"({def_extractable}/{max(def_total, 1)} extractable)"
+        )
+
+        # ── 13. Citability Pattern Match (data-driven) ──
+        ca = getattr(state, 'citability_analysis', None) or {}
+        if ca and ca.get("queries_with_ai_overview", 0) > 0:
+            cp = ca.get("citation_patterns", {})
+            matched_patterns = 0
+            total_patterns = 0
+
+            if cp.get("definition_blocks", 0) >= 2:
+                total_patterns += 1
+                if len(re.findall(r'(?:^|\n)[A-Z][^.\n]*\b(?:is|are|refers to)\b[^.\n]+\.', article)) >= 2:
+                    matched_patterns += 1
+
+            if cp.get("bold_label_lists", 0) >= 2:
+                total_patterns += 1
+                if len(re.findall(r'^\*\*[^*]+\*\*:?\s+\S', article, re.MULTILINE)) >= 3:
+                    matched_patterns += 1
+
+            if cp.get("numbered_steps", 0) >= 2:
+                total_patterns += 1
+                if len(re.findall(r'^\d+\.\s+', article, re.MULTILINE)) >= 3:
+                    matched_patterns += 1
+
+            if cp.get("data_backed_claims", 0) >= 2:
+                total_patterns += 1
+                sourced = [l for l in lines if re.search(r'\d+%', l) and
+                           any(p in l.lower() for p in ["according to", "reports", "found that"])]
+                if len(sourced) >= 2:
+                    matched_patterns += 1
+
+            if total_patterns > 0:
+                match_pct = (matched_patterns / total_patterns) * 100
+                if match_pct < 50:
+                    issues.append(
+                        f"CITABILITY PATTERN MATCH: Article matches {matched_patterns}/{total_patterns} "
+                        f"({match_pct:.0f}%) of patterns found in real AI Overviews. Target: 50%+."
+                    )
+                scorecard_lines.append(
+                    f"- Citability Pattern Match: {'PASS' if match_pct >= 50 else 'FAIL'} "
+                    f"({matched_patterns}/{total_patterns}, {match_pct:.0f}%)"
+                )
+            else:
+                scorecard_lines.append("- Citability Pattern Match: SKIP (no dominant patterns)")
+        else:
+            scorecard_lines.append("- Citability Pattern Match: SKIP (no citability data)")
+
+        # ── 14. Query Fanout Coverage ──
+        if ca and ca.get("per_query_results"):
+            text_lower = article.lower()
+            queries_coverable = 0
+            queries_covered = 0
+            for qr in ca["per_query_results"]:
+                if not qr.get("has_ai_overview"):
+                    continue
+                queries_coverable += 1
+                query_words = set(w.lower() for w in qr["query"].split() if len(w) > 3)
+                query_words -= {"what", "does", "which", "where", "when", "that", "this", "have", "with"}
+                coverage = sum(1 for w in query_words if w in text_lower) / max(len(query_words), 1)
+                if coverage > 0.5:
+                    queries_covered += 1
+            if queries_coverable > 0:
+                cov_pct = (queries_covered / queries_coverable) * 100
+                if cov_pct < 60:
+                    issues.append(
+                        f"QUERY FANOUT COVERAGE: Article addresses {queries_covered}/{queries_coverable} "
+                        f"({cov_pct:.0f}%) of sub-queries with AI Overviews. Target: 60%+."
+                    )
+                scorecard_lines.append(
+                    f"- Query Fanout Coverage: {'PASS' if cov_pct >= 60 else 'FAIL'} "
+                    f"({queries_covered}/{queries_coverable}, {cov_pct:.0f}%)"
+                )
+            else:
+                scorecard_lines.append("- Query Fanout Coverage: SKIP (no AI Overviews in fanout)")
+        else:
+            scorecard_lines.append("- Query Fanout Coverage: SKIP (no fanout data)")
 
         scorecard = "AEO Scorecard:\n" + "\n".join(scorecard_lines)
         return {"issues": issues, "scorecard": scorecard}
