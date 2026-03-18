@@ -1626,10 +1626,11 @@ def run_pipeline(cli_args: argparse.Namespace):
         if f.is_file():
             console.print(f"  [dim]{f.relative_to(output_dir)}[/dim]")
 
-    # ── Publish: single approval gate for Drive + Spreadsheet + Asana ──
+    # ── Publish: Drive + Spreadsheet + Asana ──
     if state.pass_fail:
         if NONINTERACTIVE:
-            pass  # Skip in auto-approve mode
+            # Auto-publish on pass — Drive upload and spreadsheet update should always happen
+            _publish_all(state, output_dir)
         else:
             choice = Prompt.ask(
                 "\n[bold]Publish?[/bold] (Google Drive + Spreadsheet + Asana) [Enter] yes, [s] skip",

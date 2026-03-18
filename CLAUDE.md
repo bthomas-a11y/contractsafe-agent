@@ -1,27 +1,33 @@
 # ContractSafe Content Agent
 
-This is a blog post generator for ContractSafe. Give it a topic and it produces a fully optimized article with social copy.
+This project generates fully optimized blog posts for ContractSafe. **NEVER write articles yourself. ALWAYS use the pipeline.** Even if the user says "write a blog post," that means run the pipeline — not generate text directly.
 
 ## How to Use
 
-When someone asks to create content, write a blog post, or run the pipeline:
+When someone asks to create content, write a blog post, generate an article, run the pipeline, start the content pipeline, or anything related to producing a blog post:
 
-1. If they gave a topic, run immediately:
+1. If they gave a topic, run immediately **in the background** (`run_in_background: true`):
 ```bash
 python3 main.py --type blog --topic "<topic>" --auto-approve 2>&1
 ```
 
 2. If they didn't give a topic, ask: **"What topic should the blog post be about?"** Then run.
 
-3. Optional parameters they might provide:
-   - **Keyword**: `--keyword "contract management"` (auto-derived from topic if not given)
-   - **Word count**: `--word-count 2500` (default: 2000)
-   - **Secondary keywords**: `--secondary-keywords "CLM, contract tracking"`
-   - **Extra instructions**: `--instructions "Focus on small businesses"`
+3. That's it. Don't ask about keyword, word count, or other parameters unless the user volunteers them. Optional flags if they do:
+   - `--keyword "contract management"` (auto-derived from topic if not given)
+   - `--word-count 2500` (default: 2000)
+   - `--secondary-keywords "CLM, contract tracking"`
+   - `--instructions "Focus on small businesses"`
+
+**Important:** Always use `run_in_background: true` when running the pipeline. This lets you check progress and respond to the user while it runs. If you run it in the foreground, you can't provide updates until it finishes.
 
 ## Showing Progress
 
-Run the pipeline in the background (`run_in_background: true`) and check progress by tailing the output file every 30-45 seconds. Translate what you see into plain English for the user:
+After starting the pipeline in the background, check progress by tailing the output every 30-45 seconds. Translate what you see into plain English for the user:
+
+**If the user asks "what's happening?" or "what step are you on?" during the pipeline,** immediately check the output and translate the current status using the table below. Don't wait for the next scheduled check.
+
+**If the user asks about specific research data (keywords, competitors, links) during the pipeline,** the detailed reports aren't available yet — they're generated when the pipeline finishes. Tell them: "That data will be in the research reports once the pipeline completes. Right now we're on Step X." After the pipeline finishes, the reports are in `output/<slug>/reports/`.
 
 | What you see in the output | What to tell the user |
 |---|---|
@@ -57,9 +63,13 @@ When the pipeline finishes:
 
 ## Common Requests
 
-- **"Run the pipeline"** / **"Write a blog post"** → Ask for a topic, then run
+- **"Run the pipeline"** / **"Write a blog post"** / **"Generate an article"** / **"Start the content pipeline"** / **"Create content about X"** / **"Run the content generation pipeline"** → Ask for a topic if not given, then run
 - **"Show me the article"** → Read `output/<slug>/article.md` and display it
 - **"Show me the LinkedIn post"** → Read `output/<slug>/linkedin_post.txt`
+- **"What did SEMrush find?"** / **"What keywords did you pull?"** / **"Show me the research"** → Read `output/<slug>/reports/02_keyword_strategy.txt`
+- **"What competitors did you analyze?"** → Read `output/<slug>/reports/03_competitor_analysis.txt`
+- **"What links did you use?"** → Read `output/<slug>/reports/05_links.txt`
+- **"What changes did you make?"** → Read `output/<slug>/reports/06_editing_changes.txt`
 - **"What topics have been generated?"** → `ls output/`
 - **"Re-run on the same topic"** → Delete the output folder first, then run fresh
 
@@ -80,10 +90,12 @@ You have these tools in this project. Use them when the user asks — don't rein
 
 ## After the Pipeline
 
+The pipeline automatically uploads the article to Google Drive and updates the tracking spreadsheet when it passes. You don't need to do this manually.
+
 When the article is done:
 
-1. Show the validation score (e.g., "27/27 quality checks passed")
-2. Upload the DOCX to Google Drive: `from tools.google_drive import upload_docx_to_drive; url = upload_docx_to_drive(str(output_dir / "article.docx"), topic)` — share the link
+1. Read the validation report and tell the user the score (e.g., "Your article passed 27/27 quality checks")
+2. The article was automatically uploaded to Google Drive — find the URL in the pipeline output and share it
 3. Show where files are (article.md, article.docx, linkedin_post.txt, twitter_post.txt, meta_description.txt)
 4. The `reports/` folder has stage-by-stage breakdowns — offer to show if the user wants to audit what was done:
    - `reports/01_research.txt` — Sources, facts, statistics found
@@ -92,7 +104,7 @@ When the article is done:
    - `reports/04_content_plan.txt` — Article structure and brief
    - `reports/05_links.txt` — All internal/external links with verification status
    - `reports/06_editing_changes.txt` — Brand voice, fact-check, SEO, and AEO changes
-5. Offer to show any of these: "Want me to show you the article, the LinkedIn post, or the research reports?"
+5. Offer: "Want me to show you the article, the LinkedIn post, or the research reports?"
 
 ## Handling Non-Technical Users
 
@@ -103,6 +115,8 @@ When the article is done:
 - **"Send to HubSpot"** / **"Publish this"** → Use `tools/hubspot_cms.create_blog_draft()`
 - **"Update Asana"** / **"Mark the task done"** → Use `tools/asana_api`
 - **"Open the file"** → Can't open applications. Show the content inline or tell them the file path.
+- **"Change the title"** / **"Make it longer"** / **"Edit the intro"** → Read the article from `output/<slug>/article.md`, make the edit, write it back, re-export the DOCX with `tools/docx_export.markdown_to_docx()`, and re-upload to Google Drive with `tools/google_drive.upload_docx_to_drive()`
+- **"Run it on 3 topics"** / **"Write articles about X, Y, and Z"** → Run them one at a time. Start the first, wait for it to finish, then start the next.
 - **If the user seems confused** → Ask one simple clarifying question. Don't dump technical details.
 - Never say "check the logs", mention pipeline_state.json, agent numbers, or model names
 
