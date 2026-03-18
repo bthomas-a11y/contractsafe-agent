@@ -147,6 +147,16 @@ def markdown_to_docx(markdown_text: str, output_path: str, title: str = "",
         i += 1
 
     # ── Append social copy section if provided ──
+    # Clean em/en dashes from social posts (Haiku doesn't go through mechanical fixes)
+    def _clean_social(text: str) -> str:
+        return text.replace('\u2014', ', ').replace('\u2013', ', ')
+    if meta_description:
+        meta_description = _clean_social(meta_description)
+    if linkedin_post:
+        linkedin_post = _clean_social(linkedin_post)
+    if twitter_post:
+        twitter_post = _clean_social(twitter_post)
+
     if meta_description or linkedin_post or twitter_post:
         # Separator
         p = doc.add_paragraph()

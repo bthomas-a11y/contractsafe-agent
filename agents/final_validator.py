@@ -261,7 +261,9 @@ class FinalValidatorAgent(BaseAgent):
             r'cost (?:you|your|them|the) .{0,20}\$[\d,.]+|'
             r'for a \$[\d,.]+|'
             r'can run \$[\d,.]+|'       # market cost ranges ("can run $50,000 to $200,000")
-            r'run \$[\d,.]+\s+to\s+\$',  # cost range pattern
+            r'run \$[\d,.]+\s+to\s+\$|'  # cost range pattern
+            r'sells? (?:\w+ )?(?:it |them )?for \$[\d,.]+|'  # retail price metaphors ("sells it for $3")
+            r'["\u201c][^"\u201d]*\$[\d,.]+[^"\u201d]*["\u201d]',  # dollar amounts inside quotes (query examples)
             re.IGNORECASE
         )
         stat_lines = []
