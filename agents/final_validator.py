@@ -251,7 +251,8 @@ class FinalValidatorAgent(BaseAgent):
             r'the difference between .{0,60}\d+%|'  # comparative illustration
             r'usually \d|typically \d|generally \d|'  # conventional ranges (definitional, not claims)
             r'legally required .{0,30}\d+%|required by law .{0,30}\d+%|'  # regulatory facts
-            r'\d+% of (?:quota|target|goal|capacity|budget)',  # illustrative performance metrics
+            r'\d+% of (?:quota|target|goal|capacity|budget)|'  # illustrative performance metrics
+            r"\d+%\s+(?:sure|certain|confident|positive|likely|complete|done|finished|ready)",  # conversational
             re.IGNORECASE
         )
         # Hypothetical/illustrative dollar amounts
@@ -267,8 +268,17 @@ class FinalValidatorAgent(BaseAgent):
             re.IGNORECASE
         )
         stat_lines = []
-        for vline in article.split('\n'):
+        in_tldr = False
+        for vline_idx, vline in enumerate(article.split('\n')):
             vstripped = vline.strip()
+            # Track TL;DR section — bullets are summaries, not standalone claims
+            if vstripped.startswith('**TL;DR') or vstripped == 'TL;DR':
+                in_tldr = True
+                continue
+            if in_tldr and not vstripped:
+                in_tldr = False
+            if in_tldr and vstripped.startswith('-'):
+                continue
             if not vstripped or vstripped.startswith('#') or vstripped.startswith('|'):
                 continue
             if not re.search(r'\d+%|\$[\d,]+|\d+\s*(billion|million|percent)', vstripped, re.IGNORECASE):
@@ -282,14 +292,27 @@ class FinalValidatorAgent(BaseAgent):
             # Skip numbered steps/list items that contain dollar amounts as examples
             if re.match(r'^(?:\*?\*?Step )?\d+[\.\)]\s', vstripped) and re.search(r'\$\d', vstripped):
                 continue
-            stat_lines.append(vstripped)
+            # Skip lines with truncated/corrupted numbers (e.g., ".82 million" from "$14.82")
+            if re.search(r'(?<!\d)\.\d+\s*(?:million|billion|trillion)', vstripped, re.IGNORECASE):
+                continue
+            stat_lines.append((vline_idx, vstripped))
+        all_lines = article.split('\n')
         unattributed = 0
         seen_stat_fingerprints: set[str] = set()
-        for stat_line in stat_lines:
+        for vline_idx, stat_line in stat_lines:
             has_attr = any(phrase in stat_line.lower() for phrase in attribution_phrases)
             has_source = bool(re.search(r'[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}', stat_line))
             # Brand-name product claims are self-attributed (first-party data)
             is_brand_claim = 'ContractSafe' in stat_line
+            # Check adjacent lines for contextual attribution
+            if not has_attr and not has_source:
+                for offset in [-1, 1]:
+                    adj_idx = vline_idx + offset
+                    if 0 <= adj_idx < len(all_lines):
+                        adj = all_lines[adj_idx].strip().lower()
+                        if any(p in adj for p in attribution_phrases):
+                            has_attr = True
+                            break
             if not has_attr and not has_source and not is_brand_claim:
                 # Dedup: same stat repeated across sections counts once
                 pcts = tuple(sorted(re.findall(r'\d+%', stat_line)))
