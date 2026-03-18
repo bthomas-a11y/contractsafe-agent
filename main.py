@@ -588,8 +588,11 @@ def run_agent(agent_cls, state: PipelineState, agent_num: int) -> tuple[Pipeline
     agent.log = tracked_log
 
     agent_label = AGENT_INFO[agent_num - 1][2] if agent_num <= len(AGENT_INFO) else agent_cls.name
+    agent_emoji = AGENT_INFO[agent_num - 1][1] if agent_num <= len(AGENT_INFO) else ""
+    agent_phase = AGENT_INFO[agent_num - 1][3] if agent_num <= len(AGENT_INFO) else ""
     console.print(f"\n{'='*60}")
-    console.print(f"  STARTING Agent {agent_num}/13: {agent_label} (model: {agent.model}, timeout: {agent.timeout}s, budget: {remaining_budget:.0f}s)")
+    console.print(f"  {agent_emoji} STARTING Agent {agent_num}/13: {agent_label} [{agent_phase}]")
+    console.print(f"     Model: {agent.model} | Timeout: {agent.timeout}s | Budget: {remaining_budget:.0f}s")
     console.print(f"{'='*60}")
     sys.stdout.flush()
 
