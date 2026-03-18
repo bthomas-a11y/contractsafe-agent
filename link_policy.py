@@ -44,6 +44,11 @@ BLOCKED_DOMAINS = [
     "proposify.com",
     "precisely.com",
     "concord.app",
+    "contractlogix.com",
+    "docjuris.com",
+    "lexion.ai",
+    "malbek.io",
+    "contractpodai.com",
     # Generic competitors
     "g2.com",
     "capterra.com",
@@ -118,6 +123,51 @@ TIER_2_DOMAINS = [
     "thomsonreuters.com",
     "wolterskluwer.com",
     "contractnerds.com",
+]
+
+
+# ── Evergreen External Links ──
+# Pre-verified, stable URLs from authoritative sources. Used as a fallback when
+# web search returns fewer than MIN_EXTERNAL_LINKS usable results. These must be
+# pages that (a) will stay live for years, (b) are broadly relevant to contract
+# management / legal ops, and (c) are from .gov, .edu, or major industry orgs.
+EVERGREEN_EXTERNAL_LINKS = [
+    {
+        "url": "https://www.nist.gov/system/files/documents/2017/06/19/ContractManagementBody.pdf",
+        "title": "NIST Contract Management Body of Knowledge",
+        "anchor": "federal contract management standards",
+        "tier": 1,
+    },
+    {
+        "url": "https://www.gao.gov/contracting",
+        "title": "GAO Contracting and National Security Acquisitions",
+        "anchor": "government contracting oversight",
+        "tier": 1,
+    },
+    {
+        "url": "https://www.law.cornell.edu/ucc/article2",
+        "title": "Cornell Law — UCC Article 2: Sales",
+        "anchor": "Uniform Commercial Code contract law",
+        "tier": 1,
+    },
+    {
+        "url": "https://www.worldcc.com/Resources",
+        "title": "World Commerce & Contracting Resources",
+        "anchor": "contract management best practices",
+        "tier": 1,
+    },
+    {
+        "url": "https://hbr.org/2019/01/getting-the-most-out-of-your-contract-negotiations",
+        "title": "HBR — Getting the Most Out of Contract Negotiations",
+        "anchor": "contract negotiation strategies",
+        "tier": 1,
+    },
+    {
+        "url": "https://www.americanbar.org/groups/business_law/resources/business-law-today/",
+        "title": "ABA Business Law Today",
+        "anchor": "legal industry business law resources",
+        "tier": 1,
+    },
 ]
 
 

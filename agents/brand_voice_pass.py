@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 from agents.base import BaseAgent
-from agents.knowledge_loader import load_brand_voice
 from state import PipelineState
 from prompts.templates import BRAND_VOICE_PASS_SYSTEM
 from config import EDITING_MODEL
@@ -23,7 +22,7 @@ CORPORATE_PHRASES = [
     "mission-critical", "paradigm shift", "value proposition", "pain point",
     "stakeholder", "actionable insights", "move the needle", "low-hanging fruit",
     "circle back", "deep dive", "take it to the next level",
-    "digital transformation", "thought leader", "best practices",
+    "digital transformation", "thought leader",
     "key takeaway", "at the end of the day",
 ]
 
@@ -437,19 +436,211 @@ def apply_mechanical_fixes(article: str) -> str:
     article = _normalize_markdown(article)
 
     # ── 1. Replace em/en dashes ──
-    article = article.replace("\u2014", ", ")
-    article = article.replace("\u2013", ", ")
+    # Handle " — " (with surrounding spaces) first to avoid double-space artifacts
+    # Protect numeric ranges (e.g. "55–70%") before replacing dashes
+    article = re.sub(r'(\d)\s*\u2014\s*(\d)', r'\1-\2', article)  # em-dash between digits → hyphen
+    article = re.sub(r'(\d)\s*\u2013\s*(\d)', r'\1-\2', article)  # en-dash between digits → hyphen
+    article = re.sub(r'\s*\u2014\s*', ', ', article)
+    article = re.sub(r'\s*\u2013\s*', ', ', article)
     article = re.sub(r'([.!?])\s*,\s*', r'\1 ', article)
     article = re.sub(r'^\s*,\s*', '', article, flags=re.MULTILINE)
     article = re.sub(r',\s*,', ',', article)
 
-    # ── 2. Straight quotes → curly quotes ──
+    # ── 2. Strip "according to [truncated source]" artifacts ──
+    # The writer sometimes generates raw source citations like
+    # ", according to Contract Change Management Tactics That Actually W."
+    # These are truncated research titles that leaked into the output.
+    article = _strip_source_artifacts(article)
+
+    # ── 3. Straight quotes → curly quotes ──
     article = _curl_quotes(article)
 
-    # ── 3. Split long paragraphs at sentence boundaries ──
+    # ── 3b. Close unmatched curly double quotes ──
+    # If the writer produced `"word.` without a closing `"`, _curl_quotes
+    # converts it to `\u201cword.` — an opening quote that never closes.
+    # Fix: on each line, if opening count > closing count, insert a closing
+    # quote before the first sentence-end punctuation after the last opener.
+    fixed_quote_lines = []
+    for qline in article.split("\n"):
+        opens = qline.count("\u201c")
+        closes = qline.count("\u201d")
+        if opens > closes:
+            # Find the last unmatched opener and close it at the next punctuation
+            last_open = qline.rfind("\u201c")
+            # Search for sentence-ending punctuation after the opener
+            for ci in range(last_open + 1, len(qline)):
+                if qline[ci] in '.!?':
+                    qline = qline[:ci] + "\u201d" + qline[ci:]
+                    break
+            else:
+                # No punctuation found — close at end of line
+                qline = qline.rstrip() + "\u201d"
+        fixed_quote_lines.append(qline)
+    article = "\n".join(fixed_quote_lines)
+
+    # ── 3c. Close unmatched parentheses ──
+    # Writer sometimes produces "(text without closing paren."
+    fixed_paren_lines = []
+    for pline in article.split("\n"):
+        open_parens = pline.count('(')
+        close_parens = pline.count(')')
+        if open_parens > close_parens:
+            # Find the last unmatched opener, close before the period at line end
+            stripped = pline.rstrip()
+            if stripped.endswith('.'):
+                pline = stripped[:-1] + ').'
+            elif stripped.endswith('?') or stripped.endswith('!'):
+                pline = stripped[:-1] + ')' + stripped[-1]
+            else:
+                pline = stripped + ')'
+        fixed_paren_lines.append(pline)
+    article = "\n".join(fixed_paren_lines)
+
+    # ── 4. Split long paragraphs at sentence boundaries ──
     article = _split_long_paragraphs(article)
 
-    # ── 4. Clean up whitespace ──
+    # ── 5. Fix broken markdown links ──
+    # Remove orphaned [ that have no matching ] on the same line
+    # e.g., "World Commerce & [Contracting." → "World Commerce & Contracting."
+    # Must not touch valid links like [text, more text](url)
+    fixed_lines = []
+    for mline in article.split("\n"):
+        result = list(mline)
+        opens = [i for i, c in enumerate(mline) if c == '[']
+        for start in opens:
+            close = mline.find(']', start + 1)
+            if close == -1:
+                result[start] = ''  # Remove orphaned [
+        fixed_lines.append(''.join(result))
+    article = "\n".join(fixed_lines)
+
+    # ── 5b. Rejoin sentences broken across paragraph boundaries ──
+    # Pattern: line A ends mid-sentence, blank line, line B starts lowercase
+    # e.g., "...latest redline"?\n\nis another hour..."
+    rejoin_lines = article.split("\n")
+    i = 0
+    while i < len(rejoin_lines) - 2:
+        cur = rejoin_lines[i].strip()
+        # Check for blank line followed by lowercase continuation
+        if cur and rejoin_lines[i + 1].strip() == "":
+            next_content = rejoin_lines[i + 2].strip() if i + 2 < len(rejoin_lines) else ""
+            if next_content and next_content[0].islower():
+                # Rejoin: merge next_content onto current line
+                rejoin_lines[i] = rejoin_lines[i].rstrip() + " " + next_content
+                rejoin_lines[i + 1] = ""
+                rejoin_lines[i + 2] = ""
+        i += 1
+    article = "\n".join(rejoin_lines)
+
+    # ── 6. Fix punctuation artifacts ──
+    # ":. " → colon followed by period (from content removal)
+    article = article.replace(':. ', ': ')
+    article = article.replace(':.\n', ':\n')
+    # "?.\n" or "!.\n" → remove trailing period after question/exclamation
+    article = re.sub(r'([?!])\.\s', r'\1 ', article)
+    # ". But." → sentence fragment from content removal (". But [removed stat]. That's")
+    article = re.sub(r'\.\s*But\.\s*', '. ', article)
+
+    # ── 6b. Capitalize bold openers at start of lines ──
+    # "**decision-maker..." → "**Decision-maker..."
+    article = re.sub(
+        r'^(\*\*)([a-z])',
+        lambda m: m.group(1) + m.group(2).upper(),
+        article,
+        flags=re.MULTILINE
+    )
+
+    # ── 7. Fix numbered step gaps ──
+    # If steps go 1, 3, 4, 5 (missing 2), renumber to 1, 2, 3, 4
+    step_lines = article.split("\n")
+    step_indices = []
+    for si, sl in enumerate(step_lines):
+        m = re.match(r'^(\d+)\.\s', sl.strip())
+        if m:
+            step_indices.append((si, int(m.group(1))))
+    if step_indices:
+        # Find contiguous runs of numbered items
+        runs = []
+        current_run = [step_indices[0]]
+        for j in range(1, len(step_indices)):
+            prev_idx, prev_num = step_indices[j - 1]
+            cur_idx, cur_num = step_indices[j]
+            # Same run if indices are close and numbers are sequential-ish
+            if cur_idx - prev_idx <= 5 and cur_num > prev_num:
+                current_run.append(step_indices[j])
+            else:
+                runs.append(current_run)
+                current_run = [step_indices[j]]
+        runs.append(current_run)
+        for run in runs:
+            if len(run) >= 2:
+                expected = 1  # Always start at 1
+                for si_idx, (line_idx, actual_num) in enumerate(run):
+                    if actual_num != expected:
+                        old = step_lines[line_idx].strip()
+                        step_lines[line_idx] = step_lines[line_idx].replace(
+                            f"{actual_num}.", f"{expected}.", 1
+                        )
+                    expected += 1
+    article = "\n".join(step_lines)
+
+    # Also fix **Step word:** patterns (e.g., "Step one" → "Step three" gap)
+    word_to_num = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    num_to_word = {v: k for k, v in word_to_num.items()}
+    step_word_lines = article.split("\n")
+    word_step_indices = []
+    for si, sl in enumerate(step_word_lines):
+        m = re.match(r'^\*?\*?[Ss]tep\s+(\w+)', sl.strip())
+        if m and m.group(1).lower() in word_to_num:
+            word_step_indices.append((si, word_to_num[m.group(1).lower()], m.group(1)))
+    if len(word_step_indices) >= 2:
+        # Always start at 1 — if steps go 2,3,4,5 that means step 1 was dropped
+        expected = 1
+        for line_idx, actual_num, original_word in word_step_indices:
+            if actual_num != expected and expected in num_to_word:
+                new_word = num_to_word[expected]
+                # Match capitalization of original
+                if original_word[0].isupper():
+                    new_word = new_word.capitalize()
+                step_word_lines[line_idx] = step_word_lines[line_idx].replace(
+                    original_word, new_word, 1
+                )
+            expected += 1
+    article = "\n".join(step_word_lines)
+
+    # ── 8. Collapse double blank lines ──
+    while '\n\n\n' in article:
+        article = article.replace('\n\n\n', '\n\n')
+
+    # ── 9. Title-case H2 headings ──
+    # e.g., "## main points for Contract Risk" → "## Main Points for Contract Risk"
+    _tc_small = {'a', 'an', 'and', 'as', 'at', 'but', 'by', 'for', 'from',
+                 'if', 'in', 'nor', 'of', 'on', 'or', 'so', 'the', 'to',
+                 'up', 'vs', 'yet'}
+    h2_lines = article.split("\n")
+    for hi, hl in enumerate(h2_lines):
+        if hl.startswith("## ") and not hl.startswith("### "):
+            heading_text = hl[3:]
+            words = heading_text.split()
+            new_words = []
+            for wi, word in enumerate(words):
+                if not word:
+                    new_words.append(word)
+                    continue
+                # Preserve already-capitalized words (ContractSafe, CLM, etc.)
+                if word[0].isupper() or word.isupper():
+                    new_words.append(word)
+                elif wi == 0 or word.lower().rstrip(':?!.,') not in _tc_small:
+                    new_words.append(word[0].upper() + word[1:])
+                else:
+                    new_words.append(word)
+            h2_lines[hi] = "## " + " ".join(new_words)
+    article = "\n".join(h2_lines)
+
+    # ── 10. Clean up whitespace ──
     article = re.sub(r'  +', ' ', article)
     return article
 
@@ -500,6 +691,43 @@ def _chunk_by_limit(parts: list, limit: int, rejoin: str = " ") -> list:
     return chunks
 
 
+def _strip_source_artifacts(article: str) -> str:
+    """Remove 'according to [Truncated Source Title]' artifacts from writer output.
+
+    The writer sometimes leaks truncated research source titles into the text,
+    e.g., 'according to Contract Change Management Tactics That Actually W.'
+    These aren't markdown links — just raw text that reads as broken citations.
+    """
+    lines = article.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip lines that are entirely a source citation or garbled data
+        if stripped and re.match(r'^According to \d+\s', stripped):
+            continue  # "According to 16 Contract Management Statistics..." — pure citation artifact
+        if stripped and '|' in stripped and stripped.count('|') >= 3 and not stripped.startswith('|'):
+            continue  # garbled table data leaked from sources
+        # Strip ", according to [Truncated Source Title]" at end of sentences
+        # Match: comma + "according to" + long non-link text (35+ chars = likely
+        # a truncated article title, not a real source like "Deloitte" or
+        # "World Commerce & Contracting" which are under 30 chars)
+        line = re.sub(
+            r',?\s*according to [A-Z0-9][^[\n]{35,}?(?:\.|$)',
+            lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
+            line
+        )
+        # Also strip article titles used as sources (contain ? or start with number)
+        # e.g., "according to What is Contract Risk Management?."
+        # e.g., "according to 50+ Risk Management Statistics to Know in 2026."
+        line = re.sub(
+            r',?\s*according to [A-Z0-9][^[\n]*?\?[.\s]',
+            lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
+            line
+        )
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 def _split_long_paragraphs(article: str) -> str:
     """Split prose paragraphs over 42 words at sentence boundaries.
     Skips tables, bullet lists, and numbered lists — those are structural."""
@@ -529,13 +757,24 @@ def _split_long_paragraphs(article: str) -> str:
                 lambda m: m.group(0).replace('.', '\x00').replace('!', '\x01').replace('?', '\x02'),
                 para_text
             )
-            sentences = re.split(r'(?<=[.!?])\s+', protected)
+            sentences = re.split(r'(?<=[.!?])[)\]"\'"\u201d\u2019]*\s+', protected)
             sentences = [s.replace('\x00', '.').replace('\x01', '!').replace('\x02', '?') for s in sentences]
             chunks = _chunk_by_limit(sentences, 42)
-            # If a single sentence is over 42 words, leave it intact.
-            # Splitting at commas creates broken fragments that look worse
-            # than a slightly long paragraph.
-            for i, c in enumerate(chunks):
+            # If a chunk is still over 42 words (single long sentence),
+            # try splitting at colons or semicolons as a fallback.
+            final_chunks = []
+            for c in chunks:
+                if len(c.split()) > 42 and re.search(r'[:;]', c):
+                    parts = re.split(r'(?<=[:;])\s+', c, maxsplit=1)
+                    if len(parts) == 2 and all(len(p.split()) >= 5 for p in parts):
+                        # Capitalize after the split point
+                        parts[1] = parts[1][0].upper() + parts[1][1:]
+                        final_chunks.extend(parts)
+                    else:
+                        final_chunks.append(c)
+                else:
+                    final_chunks.append(c)
+            for i, c in enumerate(final_chunks):
                 result.append(c)
                 if i < len(chunks) - 1:
                     result.append("")  # blank line between splits
@@ -564,10 +803,11 @@ class BrandVoicePassAgent(BaseAgent):
     emoji = "\U0001f3a4"
 
     def run(self, state: PipelineState) -> PipelineState:
+        self.progress("Scanning for corporate language and applying brand voice fixes...")
         article = state.draft_article
 
         # ── Step 1: Apply all mechanical fixes FIRST (instant, no Claude) ──
-        self.progress("Applying mechanical fixes (dashes, quotes, paragraphs)...")
+        self.progress("Replacing dashes, stiff transitions, and corporate jargon...")
         article = apply_mechanical_fixes(article)
         mechanical_count = self._count_mechanical_fixes(state.draft_article, article)
         self.progress(f"Applied {mechanical_count} mechanical fixes programmatically")
@@ -581,29 +821,25 @@ class BrandVoicePassAgent(BaseAgent):
         for issue in issues:
             self.progress(f"  - {issue}")
 
-        # ── Step 3: If creative issues remain, send to Claude (Sonnet, small prompt) ──
+        # ── Step 3: Fix creative issues programmatically ──
+        creative_fixes = 0
         if issues:
-            issue_list = "\n".join(f"{i+1}. {issue}" for i, issue in enumerate(issues))
-            brand_voice = load_brand_voice()
+            for issue in issues:
+                if "CORPORATE" in issue or "B2B" in issue:
+                    article, count = self._fix_corporate_phrases(article, state)
+                    creative_fixes += count
+                elif "REPETITIVE" in issue:
+                    article, count = self._fix_repetitive_starts(article)
+                    creative_fixes += count
+                elif "STIFF TRANSITION" in issue:
+                    article, count = self._fix_stiff_transitions(article)
+                    creative_fixes += count
+                else:
+                    # Log issues that can't be fixed programmatically
+                    self.log(f"[yellow]Cannot fix programmatically (manual review): {issue[:100]}[/yellow]")
 
-            user_prompt = f"""## BRAND VOICE REFERENCE
-{brand_voice}
-
-## ISSUES TO FIX
-{issue_list}
-
-## ARTICLE
-===ARTICLE_START===
-{article}
-===ARTICLE_END==="""
-
-            self.progress("Having Claude fix creative voice issues (delta mode)...")
-            response = self.call_llm(BRAND_VOICE_PASS_SYSTEM, user_prompt)
-
-            changes = self.parse_delta_response(response)
-            article = self.apply_delta_changes(article, changes)
-            state.voice_issues_found = [{"change": c["find"][:50], "fix": c["replace"][:50]} for c in changes]
-            self.log(f"Applied {mechanical_count} mechanical + {len(changes)} creative fixes.")
+            state.voice_issues_found = [{"issue": i[:80], "fix": "programmatic"} for i in issues]
+            self.log(f"Applied {mechanical_count} mechanical + {creative_fixes} creative fixes (all programmatic).")
         else:
             state.voice_issues_found = []
             self.log(f"Applied {mechanical_count} mechanical fixes. No creative issues found.")
@@ -619,6 +855,204 @@ class BrandVoicePassAgent(BaseAgent):
         # Rough paragraph split count
         count += after.count("\n\n") - before.count("\n\n")
         return max(0, count)
+
+    def _fix_corporate_phrases(self, article: str, state: PipelineState) -> tuple[str, int]:
+        """Replace corporate phrases with conversational alternatives."""
+        # Don't replace terms that are in the article topic/title
+        title_words = set(state.topic.lower().split()) if hasattr(state, 'topic') else set()
+
+        replacements = {
+            "leverage": "use",
+            "leveraging": "using",
+            "leveraged": "used",
+            "streamline": "simplify",
+            "streamlined": "simplified",
+            "streamlines": "simplifies",
+            "streamlining": "simplifying",
+            "drive efficiency": "save time",
+            "optimize your": "improve your",
+            "maximize your": "get the most from your",
+            "empower your": "help your",
+            "unlock the power": "get the benefit",
+            "best-in-class": "excellent",
+            "cutting-edge": "modern",
+            "state-of-the-art": "modern",
+            "synergy": "collaboration",
+            "scalable solution": "flexible tool",
+            "robust platform": "solid tool",
+            "seamless integration": "easy connection",
+            "end-to-end": "complete",
+            "holistic approach": "complete approach",
+            "mission-critical": "essential",
+            "paradigm shift": "major change",
+            "value proposition": "benefit",
+            "pain point": "problem",
+            "pain points": "problems",
+            "stakeholder": "decision-maker",
+            "stakeholders": "decision-makers",
+            "key stakeholders": "the people who sign off",
+            "actionable insights": "useful information",
+            "move the needle": "make a real difference",
+            "low-hanging fruit": "easy wins",
+            "circle back": "revisit",
+            "deep dive": "closer look",
+            "take it to the next level": "improve it",
+            "digital transformation": "technology upgrade",
+            "thought leader": "expert",
+            "key takeaway": "main point",
+            "key takeaways": "main points",
+            "at the end of the day": "ultimately",
+            "in today's": "in the current",
+        }
+
+        count = 0
+        for phrase, replacement in replacements.items():
+            # Skip if the phrase is part of the topic/title
+            if phrase.lower() in title_words or all(w in title_words for w in phrase.lower().split()):
+                continue
+            if phrase.lower() in article.lower():
+                # Case-preserving replacement
+                pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+                new_article = pattern.sub(replacement, article)
+                if new_article != article:
+                    occurrences = len(pattern.findall(article))
+                    count += occurrences
+                    article = new_article
+                    self.progress(f"  Replaced '{phrase}' x{occurrences} → '{replacement}'")
+
+        return article, count
+
+    def _fix_repetitive_starts(self, article: str) -> tuple[str, int]:
+        """Vary sentence openings in clusters of 3+ same-start sentences."""
+        lines = article.split("\n")
+        count = 0
+        bridge_words = ["And ", "But ", "Which is why ", "That said, ", "Still, "]
+        bridge_idx = 0
+
+        for i in range(len(lines) - 2):
+            # Only process body paragraphs (not headings, lists, tables)
+            s1 = lines[i].strip()
+            s2 = lines[i + 1].strip()
+            s3 = lines[i + 2].strip()
+
+            if not all(s and not s.startswith("#") and not s.startswith("|")
+                       and not s.startswith("-") and not s.startswith("*")
+                       and len(s) > 20 for s in [s1, s2, s3]):
+                continue
+
+            w1 = s1.split()[0].lower() if s1.split() else ""
+            w2 = s2.split()[0].lower() if s2.split() else ""
+            w3 = s3.split()[0].lower() if s3.split() else ""
+
+            if w1 == w2 == w3 and w1:
+                # Vary the 2nd and 3rd sentence starts
+                bridge = bridge_words[bridge_idx % len(bridge_words)]
+                bridge_idx += 1
+                # Lowercase the first word of the original sentence
+                words = lines[i + 1].strip().split()
+                if len(words) > 1:
+                    words[0] = words[0].lower()
+                    lines[i + 1] = bridge + " ".join(words)
+                    count += 1
+
+        return "\n".join(lines), count
+
+    def _fix_stiff_transitions(self, article: str) -> tuple[str, int]:
+        """Replace stiff transitions with conversational bridges."""
+        bridges = {
+            "furthermore": "And here\u2019s the thing:",
+            "additionally": "On top of that,",
+            "moreover": "What\u2019s more,",
+            "consequently": "So naturally,",
+            "subsequently": "After that,",
+            "nevertheless": "But still,",
+            "in conclusion": "Which brings us back to the big question.",
+            "to summarize": "So, the short version:",
+            "in summary": "The short version:",
+            "in essence": "Basically,",
+            "it is important to note": "Worth knowing:",
+            "it should be noted": "Here\u2019s the thing:",
+            "it is worth noting": "Here\u2019s the thing:",
+            "as mentioned above": "As we covered,",
+            "as previously stated": "Like we said,",
+            "as discussed earlier": "As we talked about,",
+            "with that being said": "That said,",
+            "that being said": "That said,",
+            "in today\u2019s": "In the current",
+            "in the modern": "In today\u2019s",
+        }
+
+        count = 0
+        for stiff, bridge in bridges.items():
+            pattern = re.compile(re.escape(stiff), re.IGNORECASE)
+            if pattern.search(article):
+                article = pattern.sub(bridge, article)
+                count += 1
+
+        return article, count
+
+    def _extract_issue_excerpts(self, article: str, issues: list[str]) -> str:
+        """Extract only paragraphs containing issues, with ±1 paragraph context.
+
+        Reduces prompt from ~19k (full article) to ~3-5k (relevant excerpts only).
+        """
+        paragraphs = article.split("\n\n")
+        relevant = set()
+
+        for issue in issues:
+            if "CORPORATE" in issue or "B2B" in issue:
+                for i, para in enumerate(paragraphs):
+                    for phrase in CORPORATE_PHRASES:
+                        if phrase in para.lower():
+                            relevant.add(i)
+                            break
+
+            if "STIFF TRANSITION" in issue:
+                for i, para in enumerate(paragraphs):
+                    for trans in STIFF_TRANSITIONS:
+                        if trans in para.lower():
+                            relevant.add(i)
+                            break
+
+            if "REPETITIVE" in issue:
+                for i, para in enumerate(paragraphs):
+                    sentences = re.split(r'(?<=[.!?])\s+', para.strip())
+                    if len(sentences) >= 3:
+                        for j in range(len(sentences) - 2):
+                            w = [s.split() for s in sentences[j:j+3]]
+                            if all(w_s for w_s in w) and w[0][0].lower() == w[1][0].lower() == w[2][0].lower():
+                                relevant.add(i)
+                                break
+
+            if "CONVERSATIONAL MARKER" in issue or "PARENTHETICAL" in issue or "READER ENGAGEMENT" in issue:
+                # For personality issues, include body paragraphs that are flat/explanatory
+                for i, para in enumerate(paragraphs):
+                    stripped = para.strip()
+                    if (stripped and not stripped.startswith("#") and not stripped.startswith("|")
+                            and not stripped.startswith("-") and len(stripped) > 80):
+                        relevant.add(i)
+                        if len(relevant) > 15:
+                            break
+
+        if not relevant:
+            # Fallback: send first ~3k chars
+            return article[:3000]
+
+        # Expand ±1 paragraph for context
+        expanded = set()
+        for idx in relevant:
+            for j in range(max(0, idx - 1), min(len(paragraphs), idx + 2)):
+                expanded.add(j)
+
+        result = []
+        prev_idx = -2
+        for i in sorted(expanded):
+            if i > prev_idx + 1:
+                result.append("...")
+            result.append(paragraphs[i])
+            prev_idx = i
+
+        return "\n\n".join(result)
 
     # ── Programmatic voice/style audit ──
 

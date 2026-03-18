@@ -47,7 +47,7 @@ class SocialCopyAgent(BaseAgent):
 
 Write the meta description, LinkedIn post, and X/Twitter post."""
 
-        self.progress("Writing meta description and social posts (Haiku)...")
+        self.progress("Generating meta description, LinkedIn post, and X/Twitter post...")
         response = self.call_llm(SOCIAL_COPY_SYSTEM, user_prompt)
 
         # Parse response sections

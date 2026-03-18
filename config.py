@@ -29,6 +29,14 @@ KEYWORDS_PEOPLE_USE_API_KEY = os.environ.get("KEYWORDS_PEOPLE_USE_API_KEY", "")
 # People Also Ask, competitor organic keywords, keyword gap analysis
 SEMRUSH_API_KEY = os.environ.get("SEMRUSH_API_KEY", "")
 
+# --- HubSpot CMS ---
+HUBSPOT_ACCESS_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+HUBSPOT_CONTENT_GROUP_ID = os.environ.get("HUBSPOT_CONTENT_GROUP_ID", "")
+
+# --- Asana ---
+ASANA_ACCESS_TOKEN = os.environ.get("ASANA_ACCESS_TOKEN", "")
+ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "")
+
 # --- Model Configuration (used with claude CLI) ---
 RESEARCH_MODEL = "sonnet"
 WRITER_MODEL = "opus"        # Agents 7 (Content Writer) and 8 (Brand Voice) use Opus
@@ -48,8 +56,8 @@ STYLE_RULES_FILE = KNOWLEDGE_DIR / "style_rules.md"
 
 # --- Claude CLI ---
 CLAUDE_CLI = "claude"
-MAX_RETRIES = 2       # fail fast — 2 attempts, not 3
-RETRY_BASE_DELAY = 2  # seconds, exponential backoff
+MAX_RETRIES = 1       # No retries. If it fails, investigate immediately.
+RETRY_BASE_DELAY = 2  # seconds (unused with MAX_RETRIES=1, kept for interface)
 
 # --- Web Fetch ---
 WEB_FETCH_TIMEOUT = 15  # seconds
@@ -58,3 +66,22 @@ WEB_FETCH_MAX_CONTENT_LENGTH = 50000  # characters, truncate after this
 # --- Tavily ---
 TAVILY_SEARCH_DEPTH = "basic"  # "basic" = 1 credit, "advanced" = 2 credits
 TAVILY_MAX_RESULTS = 10
+
+# --- Pipeline Time Budget ---
+PIPELINE_BUDGET_SECONDS = 600  # 10 minutes hard cap for entire pipeline (research + writing + editing)
+
+# Budget for just the editing tail (agents 8-13, after article is written).
+# These agents are editing an existing article — should take ~2 min total.
+EDITING_BUDGET_SECONDS = 180  # 3 minutes hard cap for agents 8-13
+
+# Expected times per agent (seconds). If an agent exceeds this, a warning is printed.
+# These are caps, not targets — the agent should finish well within.
+AGENT_EXPECTED_TIMES = {
+    7: 240,   # Writer (Opus) — multi-call: 3-4 calls × ~60s each, cap at 240
+    8: 60,    # Brand Voice (Sonnet) — expect ~40s, cap at 60
+    9: 5,     # Fact Check — programmatic, near-instant
+    10: 60,   # SEO Pass (Sonnet) — expect ~30s after prompt reduction, cap at 60
+    11: 90,   # AEO Pass (Sonnet) — expect ~60s, cap at 90
+    12: 15,   # Social Copy (Haiku) — expect ~5s, cap at 15
+    13: 5,    # Final Validator — programmatic, near-instant
+}

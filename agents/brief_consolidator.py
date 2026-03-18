@@ -16,7 +16,7 @@ class BriefConsolidatorAgent(BaseAgent):
     emoji = "\U0001f4cb"
 
     def run(self, state: PipelineState) -> PipelineState:
-        self.progress("Consolidating research into brief (template-based)...")
+        self.progress("Assembling writer brief from research, SEO data, and citations...")
         state.consolidated_brief = self._build_brief(state)
         self.log(f"Brief generated ({len(state.consolidated_brief)} chars)")
         return state
@@ -152,6 +152,30 @@ class BriefConsolidatorAgent(BaseAgent):
             sections.append("## SERP Features Detected")
             for f in state.serp_features:
                 sections.append(f"- {f}")
+            sections.append("")
+
+        # ── Keyword Clusters (from SEMrush) ──
+        if state.keyword_clusters:
+            sections.append("## Keyword Clusters to Target")
+            for cluster in state.keyword_clusters:
+                name = cluster.get("name", "")
+                keywords = cluster.get("keywords", [])
+                if keywords:
+                    kw_list = ", ".join(
+                        f"{k['keyword']} (vol: {k.get('volume', 'N/A')})"
+                        for k in keywords[:5]
+                    )
+                    sections.append(f"- **{name}:** {kw_list}")
+            sections.append("")
+
+        # ── Keyword Gaps (from SEMrush) ──
+        if state.keyword_gaps:
+            sections.append("## Keyword Gap Opportunities")
+            sections.append("*Keywords competitors rank for that we don't — weave into content where natural:*")
+            for gap in state.keyword_gaps[:8]:
+                kw = gap.get("keyword", "")
+                vol = gap.get("volume", "N/A")
+                sections.append(f"- {kw} (vol: {vol})")
             sections.append("")
 
         return "\n".join(sections)

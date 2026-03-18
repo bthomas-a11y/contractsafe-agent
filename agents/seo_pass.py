@@ -302,6 +302,56 @@ class SEOPassAgent(BaseAgent):
                         placed = True
                         break
 
+        # Fallback: if we still haven't reached 5, wrap keyword phrases directly
+        if link_type == "internal":
+            # Count current internal links (including any just placed above)
+            current_internal = len(re.findall(
+                r'\[([^\]]+)\]\((https?://[^)]*contractsafe\.com[^)]*)\)',
+                "\n".join(lines)
+            ))
+            if current_internal < 5:
+                remaining_unused = [
+                    l for l in unused
+                    if l.get("url", "").lower() not in set(
+                        u.lower() for _, u in re.findall(
+                            r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines)
+                        )
+                    )
+                ]
+                for link in remaining_unused:
+                    if current_internal >= 5:
+                        break
+                    url = link.get("url", "")
+                    if not url:
+                        continue
+                    # Find an unlinked sentence containing "contract" + no existing link
+                    for i, line in enumerate(lines):
+                        if i in self._global_modified_lines:
+                            continue
+                        stripped = line.strip()
+                        if (not stripped or stripped.startswith("#")
+                                or stripped.startswith("|") or "](http" in stripped
+                                or len(stripped) < 30):
+                            continue
+                        low = stripped.lower()
+                        # Wrap the first 2-3 word keyword phrase found
+                        for phrase in ["contract risk management", "contract management",
+                                       "risk management", "contract risk"]:
+                            if phrase in low:
+                                idx = low.index(phrase)
+                                original = stripped[idx:idx + len(phrase)]
+                                new_stripped = (
+                                    stripped[:idx] + f"[{original}]({url})"
+                                    + stripped[idx + len(phrase):]
+                                )
+                                lines[i] = line.replace(stripped, new_stripped)
+                                modified = True
+                                current_internal += 1
+                                self._global_modified_lines.add(i)
+                                break
+                        if modified and current_internal >= 5:
+                            break
+
         return "\n".join(lines) if modified else None
 
     def _insert_link_naturally(self, sentence: str, anchor: str, url: str) -> str | None:
@@ -335,16 +385,19 @@ class SEOPassAgent(BaseAgent):
             "is", "on", "by", "at", "how", "why", "what", "are", "this",
             "that", "your", "their", "its", "can", "may", "will", "has",
         }
-        anchor_words = set(anchor_lower.split()) - stopwords
+        # Exclude brand name so links don't anchor to "ContractSafe is..." sentences
+        anchor_words = set(anchor_lower.split()) - stopwords - {'contractsafe'}
 
         if not anchor_words:
             return None
 
         words = sentence.split()
         best_span = None
-        best_score = 0
+        best_density = 0.0
+        best_span_len = 0
+        best_stopword_count = float('inf')
 
-        for span_len in range(4, 1, -1):  # prefer longer spans
+        for span_len in range(4, 1, -1):  # try all span sizes
             for start in range(len(words) - span_len + 1):
                 span = words[start:start + span_len]
                 span_text = " ".join(span)
@@ -356,11 +409,24 @@ class SEOPassAgent(BaseAgent):
                 if '[' in span_text or '](' in span_text:
                     continue
 
+                # Reject spans that cross clause or sentence boundaries
+                if any(',' in w or ';' in w or '.' in w or '!' in w or '?' in w for w in span):
+                    continue
+
                 span_lower_words = set(w.lower().strip('.,;:!?') for w in span)
                 matches = span_lower_words & anchor_words
-                if len(matches) >= 2 and len(matches) > best_score:
-                    best_score = len(matches)
-                    best_span = (start, start + span_len)
+                if len(matches) >= 2:
+                    density = len(matches) / span_len
+                    # Count stopwords in span (fewer = cleaner anchor text)
+                    sw_count = sum(1 for w in span if w.lower().strip('.,;:!?') in stopwords)
+                    # Prefer: higher density → fewer stopwords → longer span
+                    if (density > best_density or
+                            (density == best_density and sw_count < best_stopword_count) or
+                            (density == best_density and sw_count == best_stopword_count and span_len > best_span_len)):
+                        best_density = density
+                        best_span = (start, start + span_len)
+                        best_span_len = span_len
+                        best_stopword_count = sw_count
 
         if best_span is None:
             return None

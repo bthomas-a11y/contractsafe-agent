@@ -20,9 +20,10 @@ class FactCheckerAgent(BaseAgent):
 
     def run(self, state: PipelineState) -> PipelineState:
         article = state.voice_pass_article or state.draft_article
-        self.progress("Extracting claims from article...")
+        self.progress("Cross-referencing claims against research data...")
 
         # Extract claims (lines with numbers, percentages, or attribution)
+        self.progress("Extracting statistics and attribution claims...")
         claims = self._extract_claims(article)
         self.progress(f"Found {len(claims)} factual claims to verify")
 
@@ -203,6 +204,28 @@ class FactCheckerAgent(BaseAgent):
 
         return "UNVERIFIED", "No matching data found in research corpus"
 
+    def _is_only_body_of_step(self, lines: list[str], line_idx: int) -> bool:
+        """Check if this line is the sole body paragraph of a numbered step.
+
+        If removing it would leave a step heading with no body text, return True.
+        """
+        # Find previous non-blank line
+        prev_is_step = False
+        for j in range(line_idx - 1, max(line_idx - 4, -1), -1):
+            if lines[j].strip():
+                prev_is_step = bool(re.match(r'^\*\*\d+\.', lines[j].strip()))
+                break
+        if not prev_is_step:
+            return False
+        # Find next non-blank line
+        for j in range(line_idx + 1, min(line_idx + 4, len(lines))):
+            if lines[j].strip():
+                next_is_step_or_heading = bool(
+                    re.match(r'^\*\*\d+\.', lines[j].strip()) or lines[j].strip().startswith('#')
+                )
+                return next_is_step_or_heading
+        return False
+
     def _remove_unverified_claim(self, article: str, claim: str) -> tuple[str, bool]:
         """Remove an unverified claim from the article. Returns (revised_article, was_removed).
 
@@ -225,8 +248,12 @@ class FactCheckerAgent(BaseAgent):
             lines = article.split("\n")
             new_lines = []
             removed = False
-            for line in lines:
+            for li, line in enumerate(lines):
                 if stat_text in line and not line.strip().startswith("#"):
+                    # Guard: don't remove if it's the sole body of a numbered step
+                    if self._is_only_body_of_step(lines, li):
+                        new_lines.append(line)
+                        continue
                     # Check this isn't a completely different stat
                     line_lower = line.lower()
                     claim_words = set(re.split(r'\W+', claim.lower()))
@@ -244,7 +271,17 @@ class FactCheckerAgent(BaseAgent):
 
         # Direct match — remove the line
         lines = article.split("\n")
-        new_lines = [line for line in lines if claim_trimmed not in line]
-        if len(new_lines) < len(lines):
+        new_lines = []
+        removed = False
+        for li, line in enumerate(lines):
+            if claim_trimmed in line:
+                # Guard: don't remove if it's the sole body of a numbered step
+                if self._is_only_body_of_step(lines, li):
+                    new_lines.append(line)
+                    continue
+                removed = True
+                continue
+            new_lines.append(line)
+        if removed:
             return "\n".join(new_lines), True
         return article, False

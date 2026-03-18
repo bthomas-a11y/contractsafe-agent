@@ -11,9 +11,8 @@ from state import PipelineState
 from tools.web_search import web_search
 from tools.keyword_research import google_autocomplete
 from tools.semrush import (
-    keyword_difficulty as semrush_kd,
     batch_keyword_overview as semrush_batch,
-    broad_match_keywords as semrush_broad,
+    domain_organic_keywords as semrush_domain_kws,
 )
 from config import SEMRUSH_API_KEY
 
@@ -25,6 +24,7 @@ class SEOResearcherAgent(BaseAgent):
     emoji = "\U0001f4ca"
 
     def run(self, state: PipelineState) -> PipelineState:
+        self.progress("Analyzing search results and building content structure...")
         # --- SERP analysis (Tavily: ~2 credits) ---
         self.progress(f"Analyzing SERP for: {state.target_keyword}")
         serp_results = web_search(state.target_keyword, num_results=10)
@@ -43,18 +43,18 @@ class SEOResearcherAgent(BaseAgent):
         existing_questions = state.keyword_data.get("questions_people_ask", [])
         all_questions = list(dict.fromkeys(existing_questions + extra_questions))
 
-        # --- SEMrush data ---
+        # --- SEMrush data (read from Agent 3's state, not re-fetched) ---
         semrush_section = ""
-        if SEMRUSH_API_KEY:
-            self.progress("Pulling SEMrush difficulty and keyword data...")
+        semrush_raw = state.keyword_data.get("semrush", {})
+        has_semrush = bool(semrush_raw.get("search_volume"))
 
-            all_kws = [state.target_keyword] + state.secondary_keywords
-            related = state.keyword_data.get("related_terms", [])[:10]
-            all_kws.extend(related)
-            difficulty_data = semrush_kd(all_kws)
+        if has_semrush:
+            self.progress("Using SEMrush data from Agent 3 (no duplicate API calls)...")
 
-            batch_data = semrush_batch(state.secondary_keywords[:20]) if state.secondary_keywords else []
-            broad_data = semrush_broad(state.target_keyword, limit=15)
+            # Read pre-fetched data from Agent 3
+            difficulty_data = semrush_raw.get("difficulty", [])
+            related_data = semrush_raw.get("related_keywords", [])
+            broad_data = semrush_raw.get("broad_match", [])
 
             if difficulty_data:
                 semrush_section += "\n## SEMrush Keyword Difficulty Scores\n"
@@ -63,26 +63,52 @@ class SEOResearcherAgent(BaseAgent):
                     diff = kd.get("Keyword Difficulty Index", kd.get("Kd", ""))
                     semrush_section += f"- {kw}: difficulty={diff}/100\n"
 
-            if batch_data:
-                semrush_section += "\n## SEMrush Secondary Keyword Volumes\n"
-                for b in batch_data:
-                    kw = b.get("Keyword", b.get("Ph", ""))
-                    vol = b.get("Search Volume", b.get("Nq", ""))
-                    cpc = b.get("CPC", b.get("Cp", ""))
-                    semrush_section += f"- {kw}: vol={vol}, CPC=${cpc}\n"
+            # Only API call Agent 4 makes: batch volumes for secondary keywords
+            # (Agent 3 doesn't cover these)
+            if SEMRUSH_API_KEY and state.secondary_keywords:
+                self.progress("Checking secondary keyword volumes via SEMRush...")
+                batch_data = semrush_batch(state.secondary_keywords[:20])
+                if batch_data:
+                    semrush_section += "\n## SEMrush Secondary Keyword Volumes\n"
+                    for b in batch_data:
+                        kw = b.get("Keyword", b.get("Ph", ""))
+                        vol = b.get("Search Volume", b.get("Nq", ""))
+                        cpc = b.get("CPC", b.get("Cp", ""))
+                        semrush_section += f"- {kw}: vol={vol}, CPC=${cpc}\n"
 
-            if broad_data:
-                semrush_section += "\n## SEMrush Broad Match / Long-Tail Opportunities\n"
-                for b in broad_data:
-                    kw = b.get("Keyword", b.get("Ph", ""))
-                    vol = b.get("Search Volume", b.get("Nq", ""))
-                    diff = b.get("Keyword Difficulty Index", b.get("Kd", ""))
-                    semrush_section += f"- {kw}: vol={vol}, difficulty={diff}\n"
+            # --- Keyword Clusters (built from Agent 3's data) ---
+            self.progress("Building keyword clusters from SEMrush data...")
+            all_semrush_kws = related_data + broad_data
+            clusters = self._build_keyword_clusters(state.target_keyword, all_semrush_kws)
+            state.keyword_clusters = clusters
+
+            if clusters:
+                semrush_section += "\n## Keyword Clusters (by intent/topic)\n"
+                for cluster in clusters:
+                    semrush_section += f"\n**{cluster['name']}** ({len(cluster['keywords'])} keywords)\n"
+                    for kw_info in cluster["keywords"][:5]:
+                        semrush_section += f"- {kw_info['keyword']}: vol={kw_info.get('volume', 'N/A')}, diff={kw_info.get('difficulty', 'N/A')}\n"
+                self.log(f"Built {len(clusters)} keyword clusters")
+
+            # --- Keyword Gaps (vs top competitors from SERP) ---
+            if SEMRUSH_API_KEY:
+                self.progress("Running keyword gap analysis vs top competitors...")
+                gap_keywords = self._find_keyword_gaps(serp_results)
+                state.keyword_gaps = gap_keywords
+
+                if gap_keywords:
+                    semrush_section += "\n## Keyword Gaps (competitors rank, we don't)\n"
+                    for gap in gap_keywords[:15]:
+                        kw = gap.get("keyword", "")
+                        vol = gap.get("volume", "N/A")
+                        competitor = gap.get("competitor", "")
+                        semrush_section += f"- {kw}: vol={vol} (from {competitor})\n"
+                    self.log(f"Found {len(gap_keywords)} keyword gap opportunities")
 
             if semrush_section:
                 self.log("SEMrush data enriched SEO analysis")
         else:
-            self.progress("SEMrush not configured, proceeding with SERP analysis only")
+            self.progress("No SEMrush data from Agent 3, proceeding with SERP analysis only")
 
         # --- Build recommended H2s programmatically ---
         self.progress("Building H2 recommendations programmatically...")
@@ -188,6 +214,138 @@ class SEOResearcherAgent(BaseAgent):
         # Limit to a reasonable number
         return h2_candidates[:10]
 
+    def _build_keyword_clusters(self, target_keyword: str, semrush_keywords: list[dict]) -> list[dict]:
+        """Group SEMrush keywords into topical clusters by shared content words."""
+        if not semrush_keywords:
+            return []
+
+        # Normalize keywords and extract metadata
+        kw_items = []
+        seen = set()
+        for item in semrush_keywords:
+            phrase = item.get("Keyword", item.get("Ph", "")).lower().strip()
+            if not phrase or phrase in seen:
+                continue
+            seen.add(phrase)
+            kw_items.append({
+                "keyword": phrase,
+                "volume": item.get("Search Volume", item.get("Nq", "N/A")),
+                "difficulty": item.get("Keyword Difficulty Index", item.get("Kd", "N/A")),
+                "words": set(w for w in phrase.split() if len(w) > 2),
+            })
+
+        if not kw_items:
+            return []
+
+        # Define cluster seeds based on common intent patterns
+        target_words = set(w.lower() for w in target_keyword.split() if len(w) > 2)
+        cluster_seeds = {
+            "Definitions & Basics": {"what", "definition", "meaning", "difference", "vs", "versus"},
+            "How-To & Process": {"how", "write", "draft", "create", "steps", "process", "template"},
+            "Examples & Templates": {"example", "sample", "template", "format", "letter"},
+            "Legal & Compliance": {"legal", "law", "enforce", "binding", "clause", "provision", "court"},
+            "Cost & Business Impact": {"cost", "price", "fee", "business", "risk", "benefit", "value"},
+        }
+
+        clusters = {name: [] for name in cluster_seeds}
+        unclustered = []
+
+        for item in kw_items:
+            placed = False
+            best_cluster = None
+            best_overlap = 0
+
+            for cluster_name, seed_words in cluster_seeds.items():
+                overlap = len(item["words"] & seed_words)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_cluster = cluster_name
+
+            if best_overlap > 0 and best_cluster:
+                clusters[best_cluster].append({
+                    "keyword": item["keyword"],
+                    "volume": item["volume"],
+                    "difficulty": item["difficulty"],
+                })
+                placed = True
+
+            if not placed:
+                unclustered.append({
+                    "keyword": item["keyword"],
+                    "volume": item["volume"],
+                    "difficulty": item["difficulty"],
+                })
+
+        # Build result — only include non-empty clusters, sorted by size
+        result = []
+        for name, keywords in sorted(clusters.items(), key=lambda x: len(x[1]), reverse=True):
+            if keywords:
+                # Sort by volume (descending) within each cluster
+                keywords.sort(key=lambda x: int(x["volume"]) if str(x["volume"]).isdigit() else 0, reverse=True)
+                result.append({"name": name, "keywords": keywords})
+
+        if unclustered:
+            unclustered.sort(key=lambda x: int(x["volume"]) if str(x["volume"]).isdigit() else 0, reverse=True)
+            result.append({"name": "Other Related Keywords", "keywords": unclustered})
+
+        return result
+
+    def _find_keyword_gaps(self, serp_results: list[dict]) -> list[dict]:
+        """Find keywords that top SERP competitors rank for that contractsafe.com doesn't."""
+        if not serp_results:
+            return []
+
+        from urllib.parse import urlparse
+
+        # Get top 3 competitor domains from SERP results
+        competitor_domains = []
+        seen_domains = set()
+        for r in serp_results:
+            url = r.get("url", "")
+            if not url:
+                continue
+            domain = urlparse(url).netloc.replace("www.", "")
+            # Skip our own domain and common non-competitor sites
+            if domain in seen_domains or "contractsafe" in domain:
+                continue
+            skip = {"youtube.com", "wikipedia.org", "reddit.com", "quora.com", "linkedin.com"}
+            if domain in skip:
+                continue
+            seen_domains.add(domain)
+            competitor_domains.append(domain)
+            if len(competitor_domains) >= 3:
+                break
+
+        if not competitor_domains:
+            return []
+
+        # Get our keywords
+        self.progress(f"SEMrush: fetching contractsafe.com organic keywords...")
+        our_kws = semrush_domain_kws("contractsafe.com", limit=100)
+        our_phrases = {r.get("Keyword", r.get("Ph", "")).lower() for r in our_kws}
+
+        gap_keywords = []
+        seen_gap = set()
+
+        for domain in competitor_domains:
+            self.progress(f"SEMrush: keyword gap vs {domain}...")
+            their_kws = semrush_domain_kws(domain, limit=50)
+            for r in their_kws:
+                phrase = r.get("Keyword", r.get("Ph", "")).lower()
+                vol = r.get("Search Volume", r.get("Nq", "0"))
+                if phrase and phrase not in our_phrases and phrase not in seen_gap:
+                    seen_gap.add(phrase)
+                    gap_keywords.append({
+                        "keyword": phrase,
+                        "volume": vol,
+                        "position": r.get("Position", r.get("Po", "")),
+                        "competitor": domain,
+                    })
+
+        # Sort by volume descending
+        gap_keywords.sort(key=lambda x: int(x["volume"]) if str(x["volume"]).isdigit() else 0, reverse=True)
+        return gap_keywords[:30]
+
     def _detect_serp_features(self, serp_results: list[dict]) -> list[str]:
         """Detect SERP features from search results."""
         features = []
@@ -249,6 +407,22 @@ class SEOResearcherAgent(BaseAgent):
         # SEMrush data
         if semrush_section:
             sections.append(semrush_section)
+
+        # Keyword clusters
+        if state.keyword_clusters:
+            sections.append("## Keyword Clusters")
+            for cluster in state.keyword_clusters:
+                sections.append(f"### {cluster['name']}")
+                for kw_info in cluster["keywords"][:5]:
+                    sections.append(f"- {kw_info['keyword']} (vol: {kw_info.get('volume', 'N/A')})")
+            sections.append("")
+
+        # Keyword gaps
+        if state.keyword_gaps:
+            sections.append("## Keyword Gap Opportunities")
+            for gap in state.keyword_gaps[:10]:
+                sections.append(f"- {gap['keyword']} (vol: {gap.get('volume', 'N/A')}, competitor: {gap.get('competitor', '')})")
+            sections.append("")
 
         # Competitor analysis
         if state.competitor_pages:

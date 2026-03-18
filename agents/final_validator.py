@@ -41,7 +41,7 @@ class FinalValidatorAgent(BaseAgent):
         self.progress("Applying final mechanical cleanup (dashes, paragraphs)...")
         article = apply_mechanical_fixes(article)
 
-        self.progress("Running final validation checks programmatically...")
+        self.progress("Running 27-point quality checklist...")
 
         checks = []
         overall_pass = True
@@ -123,6 +123,14 @@ class FinalValidatorAgent(BaseAgent):
         checks.append(("No Naked URLs", passed, f"{len(naked_urls)} found" if naked_urls else ""))
 
         # ── 11. Meta description ──
+        # Auto-trim to 160 chars at last sentence boundary if over limit
+        if state.meta_description and len(state.meta_description) > 160:
+            trimmed = state.meta_description[:160]
+            last_period = trimmed.rfind(".")
+            if last_period > 80:
+                state.meta_description = trimmed[:last_period + 1]
+            else:
+                state.meta_description = trimmed.rsplit(" ", 1)[0] + "..."
         has_meta = bool(state.meta_description and len(state.meta_description) > 20)
         meta_len = len(state.meta_description) if state.meta_description else 0
         passed = has_meta and meta_len <= 160
@@ -165,6 +173,246 @@ class FinalValidatorAgent(BaseAgent):
         checks.append(("No Social Copy in Body", passed, "Social copy found in article" if has_social_in_body else ""))
         if not passed:
             overall_pass = False
+
+        # ── 17. AEO Answer Blocks ──
+        # Each H2 section should open with a direct answer (≥10 substantive words)
+        h2_sections = re.split(r'^## ', article, flags=re.MULTILINE)
+        h2_total = max(len(h2_sections) - 1, 1)  # skip pre-H2 content
+        h2_with_answer = 0
+        for section in h2_sections[1:]:  # skip content before first H2
+            lines = section.strip().split('\n')
+            # First line is the heading text, find first substantive paragraph after it
+            for line in lines[1:]:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                # Skip bullet/numbered list lines — we want a prose answer
+                if stripped.startswith('- ') or stripped.startswith('* ') or re.match(r'^\d+[\.\)]\s', stripped):
+                    break
+                # Count substantive words (skip markdown artifacts)
+                words = [w for w in stripped.split() if not w.startswith('[') and not w.startswith('(')]
+                if len(words) >= 10:
+                    h2_with_answer += 1
+                break
+        answer_pct = (h2_with_answer / h2_total * 100) if h2_total > 0 else 0
+        passed = answer_pct >= 70
+        checks.append(("AEO Answer Blocks", passed,
+                       f"{h2_with_answer}/{h2_total} H2s have answer blocks ({answer_pct:.0f}%, target: ≥70%)"))
+        if not passed:
+            overall_pass = False
+
+        # ── 18. AEO Freshness ──
+        import datetime
+        current_year = str(datetime.date.today().year)
+        prior_year = str(int(current_year) - 1)
+        has_freshness = current_year in article or prior_year in article
+        checks.append(("AEO Freshness", has_freshness,
+                       f"{'Found' if has_freshness else 'Missing'} year reference ({current_year} or {prior_year})"))
+        if not has_freshness:
+            overall_pass = False
+
+        # ── 19. AEO Source Attribution ──
+        attribution_phrases = ["according to", "reports", "found that", "shows that",
+                               "data from", "survey by", "study by", "research by",
+                               "published by", "cited by", "per ", "says ",
+                               "estimates that", "estimated that", "estimates "]
+        # Example patterns — illustrative numbers, not statistical claims
+        example_patterns = re.compile(
+            r'for example|such as|something like|"[^"]*\d+%[^"]*"|'
+            r'\d+% upfront|\d+% upon|\d+% at signing|'
+            r'maybe .{0,30}\d+%|could cost you \d+%|imagine .{0,30}\d+%|'
+            r"let\u2019s say .{0,30}\d+%|let's say .{0,30}\d+%",
+            re.IGNORECASE
+        )
+        # Hypothetical dollar amounts: "Your $5 million", "$500 vendor", "cost your team $200K"
+        hypo_dollar = re.compile(
+            r'your (?:\w+ )?\$[\d,.]+|'
+            r'a \$[\d,.]+\s+(?:\w+ )?(?:agreement|contract|deal|vendor|company|business|organization)|'
+            r'cost (?:you|your|them|the) .{0,20}\$[\d,.]+|'
+            r'for a \$[\d,.]+',
+            re.IGNORECASE
+        )
+        stat_lines = []
+        for vline in article.split('\n'):
+            vstripped = vline.strip()
+            if not vstripped or vstripped.startswith('#') or vstripped.startswith('|'):
+                continue
+            if not re.search(r'\d+%|\$[\d,]+|\d+\s*(billion|million|percent)', vstripped, re.IGNORECASE):
+                continue
+            # Skip illustrative examples (not statistical claims)
+            if example_patterns.search(vstripped):
+                continue
+            # Skip hypothetical dollar amounts
+            if hypo_dollar.search(vstripped) and not any(p in vstripped.lower() for p in attribution_phrases):
+                continue
+            # Skip numbered steps/list items that contain dollar amounts as examples
+            if re.match(r'^(?:\*?\*?Step )?\d+[\.\)]\s', vstripped) and re.search(r'\$\d', vstripped):
+                continue
+            stat_lines.append(vstripped)
+        unattributed = 0
+        for stat_line in stat_lines:
+            has_attr = any(phrase in stat_line.lower() for phrase in attribution_phrases)
+            has_source = bool(re.search(r'[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}', stat_line))
+            if not has_attr and not has_source:
+                unattributed += 1
+        passed = unattributed <= 2
+        checks.append(("AEO Source Attribution", passed,
+                       f"{unattributed} unattributed stats (max: 2)"))
+        if not passed:
+            overall_pass = False
+
+        # ── 20. AEO Semantic Triples ──
+        triple_verbs_re = (
+            r'\b(is|are|provides|offers|helps|enables|automates|simplifies|'
+            r'manages|delivers|supports|allows|ensures|gives|makes|handles|'
+            r'stores|tracks|organizes|streamlines|reduces)\b'
+        )
+        cs_triple_count = 0
+        for aline in article.split('\n'):
+            if 'ContractSafe' in aline and not aline.strip().startswith('#'):
+                for sent in re.split(r'(?<=[.!?])\s+', aline):
+                    if 'ContractSafe' in sent and re.search(triple_verbs_re, sent, re.IGNORECASE):
+                        cs_triple_count += 1
+        passed = cs_triple_count >= 2
+        checks.append(("AEO Semantic Triples", passed,
+                       f"{cs_triple_count} brand triples (target: ≥2)"))
+
+        # ── 21. AEO Passage Extractability ──
+        context_starters = [
+            "this is why", "this is where", "this is how",
+            "as mentioned", "as discussed", "as noted",
+            "they also", "it also", "these include",
+        ]
+        quant_refs_v = re.compile(
+            r"rounding error|that number|that figure|that percentage|"
+            r"those numbers|that\u2019s real money|that's real money|"
+            r"that\u2019s a lot|that's a lot|think about that",
+            re.IGNORECASE,
+        )
+        anaphoric_refs_v = re.compile(
+            r"^that (?:gap|divide|disconnect|difference|disparity|contrast)",
+            re.IGNORECASE,
+        )
+        context_dep_count = 0
+        article_lines = article.split('\n')
+        for idx, aline in enumerate(article_lines):
+            s = aline.strip().lower()
+            if not s or s.startswith('#') or s.startswith('|'):
+                continue
+            for starter in context_starters:
+                if s.startswith(starter):
+                    context_dep_count += 1
+                    break
+            else:
+                # Orphaned quantitative commentary
+                if len(s.split()) < 30 and quant_refs_v.search(s):
+                    if not re.search(r'\d+%|\$[\d,]+', s):
+                        prev_has = False
+                        for j in range(idx - 1, max(idx - 5, -1), -1):
+                            prev = article_lines[j].strip()
+                            if prev and not prev.startswith('#'):
+                                prev_has = bool(re.search(r'\d+%|\$[\d,]+', prev.lower()))
+                                break
+                        if not prev_has:
+                            context_dep_count += 1
+                # Orphaned anaphoric references
+                s_orig = aline.strip()
+                if len(s_orig.split()) < 25 and anaphoric_refs_v.search(s_orig):
+                    prev_data = False
+                    for j in range(idx - 1, max(idx - 5, -1), -1):
+                        prev = article_lines[j].strip()
+                        if prev and not prev.startswith('#'):
+                            prev_data = bool(re.search(r'\d+%|\$[\d,]+|only \d|just \d', prev.lower()))
+                            break
+                    if not prev_data:
+                        context_dep_count += 1
+        passed = context_dep_count == 0
+        checks.append(("AEO Passage Extractability", passed,
+                       f"{context_dep_count} context-dependent passages (target: 0)"))
+        if not passed:
+            overall_pass = False
+
+        # ── 22. AEO Quantifiable Claims ──
+        qc_count = len([
+            l for l in article.split('\n')
+            if re.search(r'\d+%|\$[\d,]+|\d+\s*(billion|million|percent)', l, re.IGNORECASE)
+            and not l.strip().startswith('#')
+        ])
+        qc_per_1000 = (qc_count / max(len(article.split()), 1)) * 1000
+        passed = qc_per_1000 >= 3
+        checks.append(("AEO Quantifiable Claims", passed,
+                       f"{qc_per_1000:.1f} per 1,000 words (target: ≥3)"))
+
+        # ── 23. AEO Entity Consistency ──
+        first_200_words = ' '.join(article.split()[:200]).lower()
+        has_entity_id = 'contractsafe' in first_200_words and any(
+            p in first_200_words for p in ['contract management', 'clm', 'software']
+        )
+        passed = has_entity_id
+        checks.append(("AEO Entity Consistency", passed,
+                       "ContractSafe identified in first 200 words" if passed else "Missing entity context in first 200 words"))
+        if not passed:
+            overall_pass = False
+
+        # ── 24. AEO Self-Describing Headings ──
+        vague_patterns = [
+            "the bottom line", "the big picture", "why it matters",
+            "how we're different", "key takeaways", "final thoughts",
+            "wrapping up", "in summary", "overview",
+        ]
+        vague_h2_count = 0
+        for h2_text in h2s:
+            h2_lower = h2_text.lower().strip('?').strip()
+            if h2_lower in vague_patterns or len(h2_lower.split()) <= 2:
+                vague_h2_count += 1
+        passed = vague_h2_count == 0
+        checks.append(("AEO Self-Describing Headings", passed,
+                       f"{vague_h2_count} vague headings (target: 0)"))
+        if not passed:
+            overall_pass = False
+
+        # ── 25. AEO Follow-Up Coverage ──
+        paa_questions = state.keyword_data.get("questions_people_ask", []) if state.keyword_data else []
+        paa_addressed = 0
+        article_lower = article.lower()
+        for q in paa_questions[:8]:
+            q_words = set(w.lower() for w in q.split() if len(w) > 3)
+            coverage = sum(1 for w in q_words if w in article_lower) / max(len(q_words), 1)
+            if coverage > 0.5:
+                paa_addressed += 1
+        paa_total = min(len(paa_questions), 8)
+        passed = paa_addressed >= max(paa_total - 2, 1) if paa_total > 0 else True
+        checks.append(("AEO Follow-Up Coverage", passed,
+                       f"{paa_addressed}/{paa_total} PAA questions addressed"))
+
+        # ── 26. AEO Structured Formats ──
+        process_h2_list = [
+            h for h in h2s
+            if any(w in h.lower() for w in ["how to", "steps", "step-by-step", "process", "guide", "write"])
+        ]
+        process_without_steps = 0
+        for ph in process_h2_list:
+            ph_pos = article.find(f"## {ph}")
+            next_h2_pos = article.find("\n## ", ph_pos + 1)
+            section = article[ph_pos:next_h2_pos] if next_h2_pos > 0 else article[ph_pos:]
+            if not re.search(r'^\d+\.\s', section, re.MULTILINE):
+                process_without_steps += 1
+        passed = process_without_steps == 0
+        checks.append(("AEO Structured Formats", passed,
+                       f"{len(process_h2_list) - process_without_steps}/{len(process_h2_list)} process sections have numbered steps"
+                       if process_h2_list else "No process sections detected"))
+
+        # ── 27. AEO Unique Value ──
+        unique_signals = [
+            r'our (data|research|analysis|findings|survey|study)',
+            r'\b(proprietary|original|first-party|exclusive)\b',
+            r'case study',
+            r'(client|customer)\s+(data|results?|story|stories)',
+            r'we (found|discovered|analyzed|measured|observed)',
+        ]
+        has_unique_content = any(re.search(p, article, re.IGNORECASE) for p in unique_signals)
+        checks.append(("AEO Unique Value", has_unique_content,
+                       "Unique content signals found" if has_unique_content else "No proprietary/original content (strategic gap)"))
 
         # ── Build report ──
         report_lines = ["# Final Validation Report\n"]
@@ -238,8 +486,14 @@ class FinalValidatorAgent(BaseAgent):
                 if re.search(r'\s-\s\S', no_links[2:]):
                     count += 1
             # Concatenated numbered items: 1. text 2. text
-            if re.match(r'^\d+\.\s', stripped) and re.search(r'\s\d+\.\s', stripped[3:]):
-                count += 1
+            # Exclude 4-digit years (e.g. "2026.") and large numbers (e.g. "page 47.")
+            # Real concatenated lists have small sequential numbers (≤20)
+            if re.match(r'^\d+\.\s', stripped):
+                for m in re.finditer(r'\s(\d+)\.\s', stripped[3:]):
+                    num = int(m.group(1))
+                    if num <= 20 and len(m.group(1)) <= 2:
+                        count += 1
+                        break
         return count
 
     def _count_broken_links(self, article: str) -> int:

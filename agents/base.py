@@ -18,8 +18,8 @@ console = Console()
 DEFAULT_TIMEOUT = 180  # 3 minutes — most agents should finish well within this
 WRITER_TIMEOUT = 300   # 5 minutes — the content writer gets more time
 
-# Heartbeat interval: print a "still waiting" message every N seconds
-HEARTBEAT_INTERVAL = 30
+# Heartbeat interval: check every 15s (shorter than before — vigilance, not patience)
+HEARTBEAT_INTERVAL = 15
 
 
 def _timestamp() -> str:
@@ -42,97 +42,128 @@ class BaseAgent:
 
     def call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """
-        Call Claude via the claude CLI with heartbeat monitoring.
+        Call Claude via the claude CLI with heartbeat monitoring and budget enforcement.
 
-        Prints a heartbeat every 30s so silence during long calls is impossible.
-        Times out and kills the process if it exceeds self.timeout.
+        No retries. If the call fails or times out, it raises immediately.
+        Fix the root cause (prompt size, approach) instead of retrying.
         """
         prompt_len = len(system_prompt) + len(user_prompt)
-        self.progress(f"Calling Claude ({self.model}, ~{prompt_len // 1000}k chars prompt, timeout {self.timeout}s)...")
 
-        for attempt in range(MAX_RETRIES):
+        # Adaptive timeout: use the smaller of agent timeout and remaining budget
+        budget = getattr(self, '_remaining_budget', None)
+        effective_timeout = self.timeout
+        if budget is not None and budget < effective_timeout:
+            effective_timeout = max(int(budget), 10)  # never less than 10s
+
+        self.progress(
+            f"Calling Claude ({self.model}, ~{prompt_len // 1000}k chars prompt, "
+            f"timeout {effective_timeout}s{f' [budget-capped from {self.timeout}s]' if effective_timeout < self.timeout else ''})..."
+        )
+
+        try:
+            cmd = [
+                CLAUDE_CLI, "-p",
+                "--model", self.model,
+                "--system-prompt", system_prompt,
+                "--setting-sources", "user",
+            ]
+
+            full_prompt = user_prompt
+
+            # Strip CLAUDECODE env var to allow nested claude CLI calls
+            env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+            start_time = time.time()
+
+            # Use Popen so we can monitor with heartbeats
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+
+            # Vigilant heartbeat: assumes the call is probably failing.
+            # At 1/3 timeout: warning. At 2/3: likely stuck. Escalating skepticism.
+            stop_heartbeat = threading.Event()
+            one_third = effective_timeout / 3
+            two_thirds = effective_timeout * 2 / 3
+
+            def heartbeat():
+                while not stop_heartbeat.is_set():
+                    stop_heartbeat.wait(HEARTBEAT_INTERVAL)
+                    if not stop_heartbeat.is_set():
+                        elapsed = time.time() - start_time
+                        remaining = effective_timeout - elapsed
+                        pct = elapsed / effective_timeout * 100
+
+                        if elapsed < one_third:
+                            self.progress(f"...waiting ({elapsed:.0f}s/{effective_timeout}s, {pct:.0f}%)")
+                        elif elapsed < two_thirds:
+                            self.log(
+                                f"[yellow]WARNING: {elapsed:.0f}s elapsed ({pct:.0f}% of timeout). "
+                                f"Prompt is ~{prompt_len // 1000}k chars. "
+                                f"This call is probably too slow.[/yellow]"
+                            )
+                        else:
+                            self.log(
+                                f"[red]LIKELY STUCK: {elapsed:.0f}s elapsed ({pct:.0f}% of timeout). "
+                                f"Only {remaining:.0f}s left. Prompt is ~{prompt_len // 1000}k chars. "
+                                f"This call will almost certainly time out. "
+                                f"Investigate prompt size immediately after failure.[/red]"
+                            )
+
+            hb_thread = threading.Thread(target=heartbeat, daemon=True)
+            hb_thread.start()
+
             try:
-                cmd = [CLAUDE_CLI, "-p", "--model", self.model]
-
-                full_prompt = f"""<system-instructions>
-{system_prompt}
-</system-instructions>
-
-{user_prompt}"""
-
-                # Strip CLAUDECODE env var to allow nested claude CLI calls
-                env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-
-                start_time = time.time()
-
-                # Use Popen so we can monitor with heartbeats
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
-                )
-
-                # Heartbeat thread: prints status every HEARTBEAT_INTERVAL seconds
-                stop_heartbeat = threading.Event()
-
-                def heartbeat():
-                    while not stop_heartbeat.is_set():
-                        stop_heartbeat.wait(HEARTBEAT_INTERVAL)
-                        if not stop_heartbeat.is_set():
-                            elapsed = time.time() - start_time
-                            remaining = self.timeout - elapsed
-                            self.progress(f"...still waiting ({elapsed:.0f}s elapsed, {remaining:.0f}s until timeout)")
-
-                hb_thread = threading.Thread(target=heartbeat, daemon=True)
-                hb_thread.start()
-
-                try:
-                    stdout, stderr = proc.communicate(input=full_prompt, timeout=self.timeout)
-                finally:
-                    stop_heartbeat.set()
-                    hb_thread.join(timeout=2)
-
-                elapsed = time.time() - start_time
-                self.progress(f"Claude responded in {elapsed:.0f}s ({len(stdout)} chars)")
-
-                if proc.returncode != 0:
-                    error_msg = stderr.strip() or "Unknown error"
-                    if attempt < MAX_RETRIES - 1:
-                        delay = RETRY_BASE_DELAY * (2 ** attempt)
-                        self.log(f"[yellow]CLI error (attempt {attempt + 1}): {error_msg}. Retrying in {delay}s...[/yellow]")
-                        time.sleep(delay)
-                        continue
-                    raise RuntimeError(f"claude CLI failed after {MAX_RETRIES} attempts: {error_msg}")
-
-                return stdout.strip()
-
-            except subprocess.TimeoutExpired:
-                # Kill the stuck process
-                proc.kill()
-                proc.wait()
+                stdout, stderr = proc.communicate(input=full_prompt, timeout=effective_timeout)
+            finally:
                 stop_heartbeat.set()
-                elapsed = time.time() - start_time
-                self.log(f"[red]TIMEOUT: Claude call killed after {elapsed:.0f}s (limit: {self.timeout}s)[/red]")
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BASE_DELAY * (2 ** attempt)
-                    self.log(f"[yellow]Retrying in {delay}s (attempt {attempt + 2}/{MAX_RETRIES})...[/yellow]")
-                    time.sleep(delay)
-                    continue
+                hb_thread.join(timeout=2)
+
+            elapsed = time.time() - start_time
+            self.progress(f"Claude responded in {elapsed:.0f}s ({len(stdout)} chars)")
+
+            # Update remaining budget
+            if budget is not None:
+                self._remaining_budget = budget - elapsed
+
+            if proc.returncode != 0:
+                error_msg = stderr.strip() or "Unknown error"
                 raise RuntimeError(
-                    f"[{self.name}] claude CLI timed out after {self.timeout}s on all {MAX_RETRIES} attempts. "
-                    f"The prompt was ~{prompt_len // 1000}k chars. Consider reducing prompt size."
+                    f"[{self.name}] claude CLI failed: {error_msg}. "
+                    f"Prompt was ~{prompt_len // 1000}k chars."
                 )
 
-            except FileNotFoundError:
-                raise RuntimeError(
-                    "claude CLI not found. Make sure 'claude' is installed and in your PATH. "
-                    "Install it with: npm install -g @anthropic-ai/claude-code"
-                )
+            return stdout.strip()
 
-        return ""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            stop_heartbeat.set()
+            elapsed = time.time() - start_time
+            raise RuntimeError(
+                f"[{self.name}] CRITICAL TIMEOUT: claude CLI timed out after {elapsed:.0f}s "
+                f"(limit: {effective_timeout}s). Prompt was ~{prompt_len // 1000}k chars.\n"
+                f"THIS IS A CRITICAL FAILURE REQUIRING AN IMMEDIATE PROGRAMMATIC FIX.\n"
+                f"DO NOT: increase timeout, adjust prompt size and retry, or add retries.\n"
+                f"REQUIRED RESPONSE:\n"
+                f"  1. Investigate root cause — what specifically caused the timeout?\n"
+                f"  2. Find proof — measure prompt size, identify which part is too large\n"
+                f"  3. Implement a PROGRAMMATIC fix that makes this timeout impossible in the future\n"
+                f"     (e.g., replace the LLM call with Python code, split into smaller calls,\n"
+                f"      or eliminate the call entirely like SEO/AEO passes)\n"
+                f"  Adjusting prompt size and hoping it works is NOT a fix — there is no proof it will work."
+            )
+
+        except FileNotFoundError:
+            raise RuntimeError(
+                "claude CLI not found. Make sure 'claude' is installed and in your PATH. "
+                "Install it with: npm install -g @anthropic-ai/claude-code"
+            )
 
     def call_llm_json(self, system_prompt: str, user_prompt: str) -> dict:
         """Call Claude and parse the response as JSON."""

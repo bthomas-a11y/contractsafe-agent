@@ -37,6 +37,8 @@ class PipelineState:
     seo_brief: str = ""
     serp_features: list[str] = field(default_factory=list)
     recommended_h2s: list[str] = field(default_factory=list)
+    keyword_clusters: list[dict] = field(default_factory=list)  # SEMrush: groups of related keywords by intent
+    keyword_gaps: list[dict] = field(default_factory=list)  # SEMrush: keywords competitors rank for that we don't
 
     # --- Agent 5: Link Research ---
     internal_links: list[dict] = field(default_factory=list)
