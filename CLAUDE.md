@@ -82,6 +82,7 @@ You have these tools in this project. Use them when the user asks — don't rein
 - **HubSpot CMS** — Create draft blog posts. `from tools.hubspot_cms import create_blog_draft`. Also via `hubspot-cms` MCP server.
 - **Asana** — Search/update tasks, add comments. `from tools.asana_api import update_task, add_comment, search_tasks`. Also via `asana` MCP server.
 - **SEMrush** — Keyword research and domain analytics. Via `semrush` MCP server and `tools/semrush.py`.
+- **DataForSEO** — Real Google SERP rankings, People Also Ask, featured snippets, SERP features. Via `tools/dataforseo.py`. Used by Agent 4 when credentials are set.
 - **DOCX Export** — Convert markdown to Word. `from tools.docx_export import markdown_to_docx`.
 - **HTML Export** — Convert markdown to HTML. `from tools.html_export import markdown_to_html`.
 - **Web Search** — Tavily API. `from tools.web_search import search`.

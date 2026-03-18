@@ -383,6 +383,8 @@ def show_welcome():
     tools_status = []
     tools_status.append(f"  Tavily: [green]active[/green]" if TAVILY_API_KEY else "  Tavily: [red]not set[/red]")
     tools_status.append(f"  SEMrush: [green]active[/green]" if SEMRUSH_API_KEY else "  SEMrush: [dim]not set[/dim]")
+    from config import DATAFORSEO_LOGIN
+    tools_status.append(f"  DataForSEO: [green]active[/green]" if DATAFORSEO_LOGIN else "  DataForSEO: [dim]not set[/dim]")
     tools_status.append(f"  KeywordsPeopleUse: [green]active[/green]" if KEYWORDS_PEOPLE_USE_API_KEY else "  KeywordsPeopleUse: [dim]not set[/dim]")
     tools_status.append("  Google Autocomplete: [green]active[/green] (always free)")
     console.print(Panel("\n".join(tools_status), title="Tool Status", border_style="dim"))

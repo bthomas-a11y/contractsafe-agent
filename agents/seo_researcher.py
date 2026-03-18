@@ -14,7 +14,8 @@ from tools.semrush import (
     batch_keyword_overview as semrush_batch,
     domain_organic_keywords as semrush_domain_kws,
 )
-from config import SEMRUSH_API_KEY
+from tools.dataforseo import serp_organic as dataforseo_serp
+from config import SEMRUSH_API_KEY, DATAFORSEO_LOGIN
 
 
 class SEOResearcherAgent(BaseAgent):
@@ -25,9 +26,33 @@ class SEOResearcherAgent(BaseAgent):
 
     def run(self, state: PipelineState) -> PipelineState:
         self.progress("Analyzing search results and building content structure...")
-        # --- SERP analysis (Tavily: ~2 credits) ---
-        self.progress(f"Analyzing SERP for: {state.target_keyword}")
-        serp_results = web_search(state.target_keyword, num_results=10)
+
+        # --- SERP analysis ---
+        # Use DataForSEO for real Google SERP data when available, Tavily as fallback
+        dataforseo_data = None
+        if DATAFORSEO_LOGIN:
+            self.progress(f"Fetching real SERP data via DataForSEO: {state.target_keyword}")
+            dataforseo_data = dataforseo_serp(state.target_keyword)
+            if dataforseo_data.get("organic"):
+                self.progress(f"DataForSEO: {len(dataforseo_data['organic'])} organic results, "
+                              f"features: {', '.join(dataforseo_data.get('serp_features', []))}")
+                # Convert DataForSEO results to the format the rest of the pipeline expects
+                serp_results = [
+                    {"title": r["title"], "url": r["url"], "snippet": r["snippet"]}
+                    for r in dataforseo_data["organic"]
+                ]
+                # Merge DataForSEO PAA into question data
+                state.keyword_data.setdefault("dataforseo_paa", [
+                    q["question"] for q in dataforseo_data.get("people_also_ask", [])
+                ])
+                state.keyword_data["dataforseo_serp"] = dataforseo_data
+            else:
+                self.progress("DataForSEO returned empty, falling back to Tavily")
+                dataforseo_data = None
+
+        if not dataforseo_data or not dataforseo_data.get("organic"):
+            self.progress(f"Analyzing SERP for: {state.target_keyword}")
+            serp_results = web_search(state.target_keyword, num_results=10)
 
         self.progress("Searching keyword variations...")
         variation_results = web_search(f"how to {state.target_keyword}", num_results=5)
@@ -39,9 +64,10 @@ class SEOResearcherAgent(BaseAgent):
             suggestions = google_autocomplete(f"{prefix} {state.target_keyword}")
             extra_questions.extend(suggestions)
 
-        # Combine with existing question data
+        # Combine with existing question data (DataForSEO PAA is highest quality — real Google)
         existing_questions = state.keyword_data.get("questions_people_ask", [])
-        all_questions = list(dict.fromkeys(existing_questions + extra_questions))
+        dataforseo_paa = state.keyword_data.get("dataforseo_paa", [])
+        all_questions = list(dict.fromkeys(dataforseo_paa + existing_questions + extra_questions))
 
         # --- SEMrush data (read from Agent 3's state, not re-fetched) ---
         semrush_section = ""
@@ -115,7 +141,7 @@ class SEOResearcherAgent(BaseAgent):
         recommended_h2s = self._build_recommended_h2s(state, all_questions)
 
         state.recommended_h2s = recommended_h2s
-        state.serp_features = self._detect_serp_features(serp_results)
+        state.serp_features = self._detect_serp_features(serp_results, dataforseo_data)
 
         # --- Build SEO brief as formatted data (no Claude synthesis) ---
         state.seo_brief = self._build_seo_brief(
@@ -353,19 +379,47 @@ class SEOResearcherAgent(BaseAgent):
         gap_keywords.sort(key=lambda x: int(x["volume"]) if str(x["volume"]).isdigit() else 0, reverse=True)
         return gap_keywords[:30]
 
-    def _detect_serp_features(self, serp_results: list[dict]) -> list[str]:
-        """Detect SERP features from search results."""
+    def _detect_serp_features(self, serp_results: list[dict], dataforseo_data: dict | None = None) -> list[str]:
+        """Detect SERP features from search results.
+
+        When DataForSEO data is available, uses actual item_types for precise
+        feature detection. Otherwise falls back to heuristic snippet analysis.
+        """
         features = []
-        for r in serp_results:
-            snippet = r.get("snippet", "").lower()
-            title = r.get("title", "").lower()
-            if "featured snippet" in snippet or "featured snippet" in title:
-                features.append("Featured Snippet")
-            if "people also ask" in snippet:
-                features.append("People Also Ask")
-        # Always note organic results
-        if serp_results:
-            features.append(f"{len(serp_results)} organic results analyzed")
+
+        if dataforseo_data and dataforseo_data.get("item_types"):
+            # Real SERP feature detection from DataForSEO
+            type_labels = {
+                "featured_snippet": "Featured Snippet",
+                "people_also_ask": "People Also Ask",
+                "knowledge_graph": "Knowledge Graph",
+                "local_pack": "Local Pack",
+                "images": "Image Pack",
+                "videos": "Video Results",
+                "shopping": "Shopping Results",
+                "related_searches": "Related Searches",
+                "ai_overview": "AI Overview",
+            }
+            for item_type in dataforseo_data["item_types"]:
+                label = type_labels.get(item_type)
+                if label:
+                    features.append(label)
+            if dataforseo_data.get("featured_snippet"):
+                fs = dataforseo_data["featured_snippet"]
+                features.append(f"Featured Snippet held by: {fs.get('domain', 'unknown')}")
+            features.append(f"{len(dataforseo_data.get('organic', []))} organic results (DataForSEO)")
+        else:
+            # Heuristic fallback from Tavily snippets
+            for r in serp_results:
+                snippet = r.get("snippet", "").lower()
+                title = r.get("title", "").lower()
+                if "featured snippet" in snippet or "featured snippet" in title:
+                    features.append("Featured Snippet")
+                if "people also ask" in snippet:
+                    features.append("People Also Ask")
+            if serp_results:
+                features.append(f"{len(serp_results)} organic results analyzed")
+
         return list(dict.fromkeys(features))  # deduplicate
 
     def _build_seo_brief(
@@ -377,14 +431,34 @@ class SEOResearcherAgent(BaseAgent):
         sections.append(f"# SEO Analysis: {state.target_keyword}\n")
 
         # SERP overview
-        sections.append("## SERP Overview")
-        for i, r in enumerate(serp_results[:10]):
-            title = r.get("title", "Untitled")
-            url = r.get("url", "")
-            snippet = r.get("snippet", "")
-            sections.append(f"{i+1}. [{title}]({url})")
-            if snippet:
-                sections.append(f"   {snippet}")
+        dataforseo = state.keyword_data.get("dataforseo_serp")
+        if dataforseo and dataforseo.get("organic"):
+            sections.append("## SERP Overview (DataForSEO — Real Google Rankings)")
+            for r in dataforseo["organic"][:10]:
+                pos = r.get("position", "?")
+                title = r.get("title", "Untitled")
+                url = r.get("url", "")
+                domain = r.get("domain", "")
+                sections.append(f"{pos}. [{title}]({url}) — {domain}")
+            if dataforseo.get("featured_snippet"):
+                fs = dataforseo["featured_snippet"]
+                sections.append(f"\n**Featured Snippet:** [{fs.get('title', '')}]({fs.get('url', '')}) — {fs.get('domain', '')}")
+                sections.append(f"   {fs.get('description', '')[:200]}")
+            if dataforseo.get("serp_features"):
+                sections.append(f"\n**SERP Features Present:** {', '.join(dataforseo['serp_features'])}")
+            if dataforseo.get("related_searches"):
+                sections.append("\n**Related Searches:**")
+                for rs in dataforseo["related_searches"][:8]:
+                    sections.append(f"- {rs}")
+        else:
+            sections.append("## SERP Overview")
+            for i, r in enumerate(serp_results[:10]):
+                title = r.get("title", "Untitled")
+                url = r.get("url", "")
+                snippet = r.get("snippet", "")
+                sections.append(f"{i+1}. [{title}]({url})")
+                if snippet:
+                    sections.append(f"   {snippet}")
         sections.append("")
 
         # Variation results

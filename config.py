@@ -29,6 +29,12 @@ KEYWORDS_PEOPLE_USE_API_KEY = os.environ.get("KEYWORDS_PEOPLE_USE_API_KEY", "")
 # People Also Ask, competitor organic keywords, keyword gap analysis
 SEMRUSH_API_KEY = os.environ.get("SEMRUSH_API_KEY", "")
 
+# --- DataForSEO ---
+# Real Google SERP data for SEO analysis. Sign up at https://app.dataforseo.com
+# When set, Agent 4 uses actual SERP rankings instead of Tavily search proxies
+DATAFORSEO_LOGIN = os.environ.get("DATAFORSEO_LOGIN", "")
+DATAFORSEO_PASSWORD = os.environ.get("DATAFORSEO_PASSWORD", "")
+
 # --- HubSpot CMS ---
 HUBSPOT_ACCESS_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 HUBSPOT_CONTENT_GROUP_ID = os.environ.get("HUBSPOT_CONTENT_GROUP_ID", "")
