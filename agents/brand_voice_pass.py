@@ -656,7 +656,7 @@ def apply_mechanical_fixes(article: str) -> str:
         # Filler openers — just delete (the sentence works without them)
         (r"(?i)Here's the thing[.:]\s*", ""),
         (r"(?i)Here's the thing about ([^.:]+)[.:]\s*", r"About \1: "),
-        (r"(?i)Here's the thing (\w+ )", r"\1"),  # "Here's the thing most" → "Most"
+        (r"(?i)Here's the thing (\w+)", lambda m: m.group(1).capitalize()),  # "Here's the thing most" → "Most"
         (r"(?i)Here's what (?:actually )?matters[.:]\s*", ""),
         (r"(?i)And here's the (?:part|thing) (?:nobody|no one) talks about(?: enough)?[.:]\s*", ""),
         (r"(?i)Let's (?:dive in|break it down|unpack this|take a closer look)[.:]\s*", ""),
@@ -701,11 +701,23 @@ def apply_mechanical_fixes(article: str) -> str:
     )
 
     # Fix concatenated words ("mismanagementMismanagement" → "mismanagement. Mismanagement")
-    article = re.sub(
-        r'([a-z])([A-Z][a-z]{3,})',
-        lambda m: m.group(0) if any(brand in m.group(0) for brand in ['ContractSafe', 'JavaScript', 'LinkedIn', 'GitHub', 'NetSuite']) else f'{m.group(1)}. {m.group(2)}',
-        article,
-    )
+    # Protect known camelCase brand names first
+    _brand_names = {'ContractSafe', 'JavaScript', 'LinkedIn', 'GitHub', 'NetSuite',
+                    'DocuSign', 'PandaDoc', 'LinkSquares', 'QuickBooks', 'NonprofitPro',
+                    'HubSpot', 'DataForSEO', 'WorldCC', 'GetApp', 'SoftwareAdvice'}
+    _brand_pattern = '|'.join(re.escape(b) for b in _brand_names)
+    # Only fix concatenation that ISN'T inside a known brand name
+    def _fix_concat(m):
+        full = m.group(0)
+        # Check if this match is part of a brand name in the surrounding context
+        start = max(0, m.start() - 15)
+        end = min(len(article), m.end() + 15)
+        context = article[start:end]
+        for brand in _brand_names:
+            if brand in context:
+                return full  # Don't touch — it's a brand name
+        return f'{m.group(1)}. {m.group(2)}'
+    article = re.sub(r'([a-z])([A-Z][a-z]{3,})', _fix_concat, article)
 
     # ── 9. Collapse double blank lines ──
     while '\n\n\n' in article:

@@ -94,9 +94,34 @@ class FinalValidatorAgent(BaseAgent):
 
         # Fix garbled attributions: "according to According to" → "according to"
         article = re.sub(r'according to According to', 'according to', article, flags=re.IGNORECASE)
-        # Fix orphaned "according to a recent." at end of sentences
         article = re.sub(r',?\s*according to [Aa]ccording to [^.]*\.', '.', article)
         article = re.sub(r',?\s*according to a recent\.', '.', article)
+
+        # Remove garbled research dump lines (truncated, double-attributed, gibberish)
+        cleaned = []
+        for line in article.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                cleaned.append(line)
+                continue
+            # Truncated lines ending with incomplete words before period
+            if re.search(r'\b[a-z]{1,4}\.\s*$', stripped) and stripped.startswith("According to"):
+                continue
+            # Double attribution
+            if stripped.lower().count("according to") >= 2:
+                continue
+            # Garbled research data: lines with unexplained acronyms/codes
+            # or lines that read like raw research notes, not article prose
+            if re.search(r'\biGX\b|\bKPU\b', stripped):
+                continue  # Research artifact, not article content
+            # Tautological sentences from broken concatenation fixes
+            # "Mismanagement of contracts can lead to big financial losses."
+            if re.match(r'^[A-Z][a-z]+ of [a-z]+ can lead to', stripped):
+                continue
+            # "a/an" grammar fix
+            line = re.sub(r'\ba ([aeiou])', r'an \1', line, flags=re.IGNORECASE)
+            cleaned.append(line)
+        article = "\n".join(cleaned)
 
         # Collapse any resulting triple+ blank lines
         article = re.sub(r'\n{3,}', '\n\n', article)
@@ -947,15 +972,9 @@ class FinalValidatorAgent(BaseAgent):
                 fix = issue.get("fix", "")
 
                 issues_found.append(f"[{issue_type}] {line_text[:60]}")
-
-                if fix and fix.lower() != "remove" and line_text and line_text in article:
-                    article = article.replace(line_text, fix, 1)
-                    self.progress(f"  Fixed [{issue_type}]: {line_text[:50]} -> {fix[:50]}")
-                elif fix and fix.lower() == "remove" and line_text and line_text in article:
-                    article = article.replace(line_text, "", 1)
-                    self.progress(f"  Removed [{issue_type}]: {line_text[:60]}")
-                else:
-                    self.progress(f"  Flagged [{issue_type}]: {line_text[:60]}")
+                # NEVER auto-apply Haiku's fixes — it returns editorial instructions
+                # ("Rewrite as..."), not replacement text. Only flag for reporting.
+                self.progress(f"  Flagged [{issue_type}]: {line_text[:60]}")
 
         if issues_found:
             self.log(f"Copy-edit found {len(issues_found)} issues")
