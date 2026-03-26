@@ -165,10 +165,25 @@ class FinalValidatorAgent(BaseAgent):
             passed = ki == len(kw_words)
         if not passed and h1_text:
             # Relaxed match for creative titles: at least 2/3 of keyword words
-            # appear anywhere in the H1 (not necessarily in order)
+            # appear anywhere in the H1 (not necessarily in order).
+            # Uses stem matching: "contracts" matches "contract", "manage" matches "management"
             kw_words = kw.split()
             h1_word_set = {re.sub(r'[^\w]', '', w) for w in h1_text.split()}
-            matches = sum(1 for w in kw_words if w in h1_word_set)
+
+            def _stem_match(kw_word, h1_words):
+                """Check if keyword word matches any H1 word by stem."""
+                if kw_word in h1_words:
+                    return True
+                # Simple stemming: check if either is a prefix of the other (4+ chars)
+                for hw in h1_words:
+                    if len(kw_word) >= 4 and len(hw) >= 4:
+                        shorter = min(kw_word, hw, key=len)
+                        longer = max(kw_word, hw, key=len)
+                        if longer.startswith(shorter[:4]):
+                            return True
+                return False
+
+            matches = sum(1 for w in kw_words if _stem_match(w, h1_word_set))
             passed = matches >= max(1, (len(kw_words) + 1) // 2)
         checks.append(("Keyword in H1", passed, f"H1: '{h1_match.group(1) if h1_match else 'NONE'}'"))
         if not passed:
@@ -926,9 +941,18 @@ class FinalValidatorAgent(BaseAgent):
             "- Sentences missing subjects or verbs\n"
             "- Orphaned fragments (e.g., 'Staff turnover.' as a standalone line)\n"
             "- Grammar errors ('a executed' -> 'an executed')\n"
-            "- AI hallmark phrases: remove or rewrite 'Here\\'s the thing', 'a different animal', "
-            "'would make a CFO faint', 'the whole game', 'Let\\'s dive in', 'navigate the complexities'\n"
-            "- Keyword-stuffed H1 title: rewrite to be specific and compelling\n"
+            "- AI hallmark phrases: remove or rewrite these and similar:\n"
+            "  'Here\\'s the thing', 'a different animal', 'the whole game',\n"
+            "  'Let\\'s dive in', 'navigate the complexities',\n"
+            "  'would make a X faint/cry' (dramatic comparisons),\n"
+            "  'Karen\\'s desktop' or any generic coworker name used as a trope,\n"
+            "  'spend less time X more time Y', 'Sound familiar?',\n"
+            "  'that\\'s not a rounding error', forced metaphor callbacks\n"
+            "- H1 TITLE: If the H1 is just the SEO keyword restated as a title "
+            "(e.g., 'Best Contract Management Software 2026'), REWRITE it to be "
+            "specific and compelling. Good titles promise something concrete: "
+            "'The 7 Contract Types Every Nonprofit Forgets to Track' not "
+            "'Best Nonprofit Contract Management Software'.\n"
             "- Lines that read like raw research data dumped into the article\n"
             "- Tautologies ('Mismanagement can lead to financial losses' after saying the same thing)\n\n"
             "Do NOT change: article structure, H2 headings, tables, markdown links, or add new content.\n\n"
