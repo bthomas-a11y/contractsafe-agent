@@ -541,6 +541,39 @@ class SEOPassAgent(BaseAgent):
                             break
                     break
 
+        # Second pass: link source name mentions even without stat numbers
+        # e.g., "according to Ken Research" should link even if the specific
+        # stat wasn't used in the article
+        for stat in state.statistics:
+            url = stat.get("source_url", "")
+            if not url or is_blocked(url) or is_internal(url):
+                continue
+            if url.lower() in linked_urls:
+                continue
+
+            source_name = stat.get("source_name", "").strip()
+            if not source_name or len(source_name) < 5:
+                continue
+
+            for i, line in enumerate(lines):
+                if i in self._global_modified_lines:
+                    continue
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.count("](") >= 2:
+                    continue
+
+                low = stripped.lower()
+                src_lower = source_name.lower()
+                idx = self._find_whole_word(src_lower, low)
+                if idx >= 0 and f"[{src_lower}" not in low:
+                    original = stripped[idx:idx + len(source_name)]
+                    new_line = stripped[:idx] + f"[{original}]({url})" + stripped[idx + len(source_name):]
+                    lines[i] = line.replace(stripped, new_line)
+                    self._global_modified_lines.add(i)
+                    linked_urls.add(url.lower())
+                    fixed.append({"change": "stat_source_link", "detail": f"Linked source name '{original}' to {url[:50]}"})
+                    break
+
         return "\n".join(lines), fixed
 
     def _dedup_existing_links(self, article: str) -> str:
@@ -604,16 +637,19 @@ class SEOPassAgent(BaseAgent):
         return None
 
     def _fix_add_links(self, article: str, available_links: list[dict], link_type: str) -> str | None:
-        """Add links from the available pool to topically relevant sentences."""
+        """Place links where the article discusses the same topic as the linked page.
+
+        Each link's anchor describes the DESTINATION — a promise to the reader
+        about what they'll find if they click. Anchors are derived from the
+        page title, not from generic keyword matches.
+        """
         from link_policy import is_blocked
 
         if not available_links:
             return None
 
-        # Find which URLs are already in the article
         existing_urls = set(u.lower() for _, u in re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', article))
 
-        # Get unused available links, filtering out blocked competitors and deduplicating by URL
         seen_urls: set[str] = set()
         unused = []
         for l in available_links:
@@ -628,224 +664,138 @@ class SEOPassAgent(BaseAgent):
         modified = False
         added = 0
 
-        for link in unused[:7]:  # try up to 7 to meet minimum of 5
+        for link in unused[:10]:
             url = link.get("url", "")
-            anchor = link.get("anchor_suggestion", "") or link.get("anchor", "")
-            if not url or not anchor:
+            title = link.get("title", "")
+            if not url:
                 continue
 
-            # Use anchor + title words for broader matching
-            title = link.get("title", "")
-            match_text = f"{anchor} {title}".lower()
-            stopwords = {"the", "a", "an", "of", "for", "and", "in", "to", "with", "is", "on", "by", "at", "how", "why", "what"}
-            anchor_words = set(match_text.split()) - stopwords
+            # Derive anchor candidates from the PAGE TITLE — not generic keywords.
+            anchor_candidates = self._title_to_anchor_phrases(title)
+            if not anchor_candidates:
+                continue
 
-            # Try with 2+ word overlap first, then fall back to 1
             placed = False
-            for min_overlap in (2, 1):
+            for anchor_phrase in anchor_candidates:
                 if placed:
                     break
-                for i, line in enumerate(lines):
+                # Enforce diversity for internal links — don't use
+                # "contract management software" for 3 different pages
+                if link_type == "internal" and self._is_anchor_repetitive(anchor_phrase):
+                    continue
+                for i, line_text in enumerate(lines):
                     if i in self._global_modified_lines:
-                        continue  # already had a link added by any fix call
-                    stripped = line.strip()
-                    link_count = stripped.count("](")
+                        continue
+                    stripped = line_text.strip()
                     if (not stripped or stripped.startswith("#") or stripped.startswith("|")
-                            or stripped.startswith("- ") or stripped.startswith("* ")
-                            or re.match(r'^\d+[\.\)]\s', stripped)
-                            or len(stripped) < 40 or url.lower() in line.lower()
-                            or link_count >= 2):
+                            or len(stripped) < 30 or stripped.count("](") >= 2
+                            or url.lower() in line_text.lower()):
                         continue
 
-                    line_words = set(stripped.lower().split())
-                    overlap = anchor_words & line_words
-                    if len(overlap) >= min_overlap and stripped.endswith("."):
-                        # Prefer a cluster phrase as anchor for diversity
-                        # (internal links only — external links to different
-                        # domains naturally share anchor text like "contract management")
-                        effective_anchor = anchor
-                        if link_type == "internal":
-                            low = stripped.lower()
-                            for cp in self._anchor_phrases:
-                                if self._is_anchor_repetitive(cp):
-                                    continue
-                                if self._find_whole_word(cp, low) >= 0 and f"[{cp}" not in low:
-                                    effective_anchor = cp
-                                    break
-                        new_line = self._insert_link_naturally(stripped, effective_anchor, url)
-                        if new_line is None:
-                            continue  # would exceed 42 words
-                        lines[i] = line.replace(stripped, new_line)
-                        modified = True
-                        added += 1
-                        self._global_modified_lines.add(i)
-                        self._record_anchor_used(effective_anchor)
-                        placed = True
-                        break
-
-        # Fallback: if we still haven't reached 5, wrap keyword phrases directly
-        if link_type == "internal":
-            # Count current internal links (including any just placed above)
-            current_internal = len(re.findall(
-                r'\[([^\]]+)\]\((https?://[^)]*contractsafe\.com[^)]*)\)',
-                "\n".join(lines)
-            ))
-            if current_internal < 5:
-                remaining_unused = [
-                    l for l in unused
-                    if l.get("url", "").lower() not in set(
-                        u.lower() for _, u in re.findall(
-                            r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines)
+                    low = stripped.lower()
+                    idx = self._find_whole_word(anchor_phrase.lower(), low)
+                    if idx >= 0 and f"[{anchor_phrase.lower()}" not in low:
+                        original = stripped[idx:idx + len(anchor_phrase)]
+                        new_stripped = (
+                            stripped[:idx] + f"[{original}]({url})"
+                            + stripped[idx + len(anchor_phrase):]
                         )
-                    )
-                ]
-                for link in remaining_unused:
-                    if current_internal >= 5:
-                        break
-                    url = link.get("url", "")
-                    if not url:
-                        continue
-                    all_internal_phrases = self._anchor_phrases
-                    placed = False
-                    for i, line in enumerate(lines):
-                        if i in self._global_modified_lines:
-                            continue
-                        stripped = line.strip()
-                        if (not stripped or stripped.startswith("#")
-                                or stripped.startswith("|")
-                                or len(stripped) < 30):
-                            continue
-                        low = stripped.lower()
-                        for phrase in all_internal_phrases:
-                            # Force anchor diversity: max 2 links per phrase
-                            if self._is_anchor_repetitive(phrase):
-                                continue
-                            idx = self._find_whole_word(phrase, low)
-                            if idx >= 0 and f"[{phrase}" not in low:
-                                before = stripped[:idx]
-                                if before.count('[') > before.count(']'):
-                                    continue
-                                original = stripped[idx:idx + len(phrase)]
-                                new_stripped = (
-                                    stripped[:idx] + f"[{original}]({url})"
-                                    + stripped[idx + len(phrase):]
-                                )
-                                lines[i] = line.replace(stripped, new_stripped)
-                                modified = True
-                                current_internal += 1
-                                self._global_modified_lines.add(i)
-                                self._record_anchor_used(phrase)
-                                placed = True
-                                break
-                        if placed:
-                            break
-                        if current_internal >= 5:
+                        if len(new_stripped.split()) <= 45:
+                            lines[i] = line_text.replace(stripped, new_stripped)
+                            self._global_modified_lines.add(i)
+                            self._record_anchor_used(anchor_phrase)
+                            modified = True
+                            added += 1
+                            placed = True
                             break
 
-        # Fallback for external links: wrap topic-relevant phrases
-        if link_type == "external":
-            all_links_now = re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines))
-            current_external = len([(t, u) for t, u in all_links_now if "contractsafe.com" not in u.lower()])
-            if current_external < 3:
-                remaining_unused = [
-                    l for l in unused
-                    if l.get("url", "").lower() not in set(
-                        u.lower() for _, u in all_links_now
-                    )
-                ]
-                for link in remaining_unused:
-                    if current_external >= 3:
-                        break
-                    url = link.get("url", "")
-                    if not url:
-                        continue
-                    # Find an unlinked sentence containing topic-related terms
-                    for i, line in enumerate(lines):
-                        if i in self._global_modified_lines:
-                            continue
-                        stripped = line.strip()
-                        if (not stripped or stripped.startswith("#")
-                                or stripped.startswith("|") or "](http" in stripped
-                                or len(stripped) < 30):
-                            continue
-                        low = stripped.lower()
-                        all_phrases = self._anchor_phrases
-                        placed = False
-                        for phrase in all_phrases:
-                            if self._is_anchor_repetitive(phrase):
-                                continue
-                            idx = self._find_whole_word(phrase, low)
-                            if idx >= 0 and f"[{phrase}" not in low:
-                                # Don't wrap if already inside a link
-                                before = stripped[:idx]
-                                if before.count('[') > before.count(']'):
-                                    continue
-                                original = stripped[idx:idx + len(phrase)]
-                                new_stripped = (
-                                    stripped[:idx] + f"[{original}]({url})"
-                                    + stripped[idx + len(phrase):]
-                                )
-                                lines[i] = line.replace(stripped, new_stripped)
-                                modified = True
-                                current_external += 1
-                                self._global_modified_lines.add(i)
-                                self._record_anchor_used(phrase)
-                                placed = True
-                                break
-                        if placed:
-                            break
-                    if current_external >= 3:
-                        break
+        # Second pass: for links not yet placed, try fuzzy span matching
+        # using the page title. This finds partial matches like "lifecycle
+        # management" in a sentence even when the full title phrase
+        # "contract lifecycle management features" doesn't appear verbatim.
+        for link in unused[:10]:
+            url = link.get("url", "")
+            title = link.get("title", "")
+            if not url or not title:
+                continue
+            if url.lower().rstrip("/") in set(
+                u.lower().rstrip("/") for _, u in
+                re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines))
+            ):
+                continue  # Already placed
 
-            # Last resort: if still short, try single-word anchors on any body line
-            if current_external < 3:
-                single_words = [
-                    "contracts", "agreements", "compliance", "procurement",
-                    "obligations", "renewals", "negotiations", "stakeholders",
-                ]
-                remaining_unused2 = [
-                    l for l in unused
-                    if l.get("url", "").lower() not in set(
-                        u.lower() for _, u in re.findall(
-                            r'\[([^\]]+)\]\((https?://[^)]+)\)', "\n".join(lines)
-                        )
-                    )
-                ]
-                for link in remaining_unused2:
-                    if current_external >= 3:
-                        break
-                    url = link.get("url", "")
-                    if not url:
-                        continue
-                    for i, line in enumerate(lines):
-                        if i in self._global_modified_lines:
-                            continue
-                        stripped = line.strip()
-                        if (not stripped or stripped.startswith("#")
-                                or stripped.startswith("|") or "](http" in stripped
-                                or len(stripped) < 30):
-                            continue
-                        low = stripped.lower()
-                        for word in single_words:
-                            if word in low and f"[{word}" not in low:
-                                idx = low.index(word)
-                                before = stripped[:idx]
-                                if before.count('[') > before.count(']'):
-                                    continue
-                                original = stripped[idx:idx + len(word)]
-                                new_stripped = (
-                                    stripped[:idx] + f"[{original}]({url})"
-                                    + stripped[idx + len(word):]
-                                )
-                                lines[i] = line.replace(stripped, new_stripped)
-                                modified = True
-                                current_external += 1
+            for i, line_text in enumerate(lines):
+                if i in self._global_modified_lines:
+                    continue
+                stripped = line_text.strip()
+                if (not stripped or stripped.startswith("#") or stripped.startswith("|")
+                        or len(stripped) < 40 or stripped.count("](") >= 2):
+                    continue
+                if stripped.endswith("."):
+                    new_line = self._insert_link_naturally(stripped, title, url)
+                    if new_line and new_line != stripped:
+                        # Verify the anchor describes the destination (2+ title words in anchor)
+                        anchor_match = re.search(r'\[([^\]]+)\]\(' + re.escape(url), new_line)
+                        if anchor_match:
+                            anchor_text = anchor_match.group(1).lower()
+                            trivial = {'the', 'a', 'an', 'of', 'for', 'and', 'to', 'in',
+                                       'your', 'you', 'how', 'best', 'do', 'need', 'is',
+                                       'are', 'this', 'that', 'with', 'it', 'can', 'we'}
+                            title_words = set(title.lower().split()) - trivial
+                            anchor_words = set(anchor_text.split()) - trivial
+                            # Anchor must describe destination: 2+ meaningful title words
+                            # Don't check overlap for fuzzy pass — the first pass
+                            # handles strict diversity. Here we just need the anchor
+                            # to describe the destination, even if it shares words
+                            # with a previous anchor.
+                            if len(title_words & anchor_words) >= 2:
+                                lines[i] = line_text.replace(stripped, new_line)
                                 self._global_modified_lines.add(i)
+                                modified = True
+                                added += 1
                                 break
-                        if current_external >= 3:
-                            break
 
         return "\n".join(lines) if modified else None
+
+    @staticmethod
+    def _title_to_anchor_phrases(title: str) -> list[str]:
+        """Extract 2-4 word anchor phrases from a page title.
+
+        'The Guide to the 6 Stages of Contract Lifecycle Management'
+        → ['stages of contract lifecycle', 'contract lifecycle management',
+           'contract lifecycle', 'stages of contract']
+        """
+        if not title:
+            return []
+        # Clean title: remove site name, year, subtitle, punctuation
+        clean = re.sub(r'\|.*$', '', title)
+        clean = re.sub(r'[:\-–—](?:\s+(?:A|An|The|Your|How|Why|What)\b).*$', '', clean)
+        clean = re.sub(r'\b20\d{2}\b', '', clean)
+        # Strip all punctuation except hyphens within words
+        clean = re.sub(r'[,:;!?()"\']', ' ', clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+
+        words = clean.split()
+        skip = {
+            'the', 'a', 'an', 'of', 'for', 'and', 'to', 'in', 'your', 'our',
+            'how', 'what', 'why', 'best', 'guide', 'top', 'new', 'key',
+            'this', 'that', 'with', 'are', 'is', 'do', 'you', 'need',
+            'according', 'from', 'provides', 'options', 'compared',
+        }
+
+        phrases = []
+        seen = set()
+        for length in (3, 2):  # 2-3 words only — keeps anchors tight
+            for i in range(len(words) - length + 1):
+                phrase = " ".join(words[i:i + length])
+                phrase_lower = phrase.lower()
+                # Must have 2+ meaningful content words, no leftover punctuation
+                content = [w for w in phrase_lower.split() if w not in skip and len(w) > 2]
+                if len(content) >= 2 and phrase_lower not in seen:
+                    seen.add(phrase_lower)
+                    phrases.append(phrase_lower)
+
+        return phrases[:6]
 
     def _insert_link_naturally(self, sentence: str, anchor: str, url: str) -> str | None:
         """Insert a link by wrapping the best matching keyword span in the sentence.
