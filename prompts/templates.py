@@ -201,6 +201,7 @@ CRITICAL — STATISTICS AND SOURCES:
 - Use ONLY statistics and source names that appear in the brief below. Do NOT invent, recall, or estimate statistics from your training data.
 - If a section would benefit from a statistic but the brief doesn't provide one, write the section with qualitative language. A missing stat is always better than a fabricated one.
 - When you use a stat from the brief, preserve the exact number and source name. Do not round, paraphrase, or attribute it to a different source.
+- ALWAYS name the specific source organization when citing a stat. Write "according to NonprofitPro" or "a World Commerce & Contracting report found" — NEVER "according to industry research" or "a recent survey found." Vague attributions can't be linked to their sources.
 - NEVER fabricate a source name. If you're unsure whether a source is in the brief, leave it out.
 
 AEO (Answer Engine Optimization) — AI engines extract PASSAGES, not pages. The first 30% gets 44% of citations.
