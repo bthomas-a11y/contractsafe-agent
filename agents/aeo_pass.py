@@ -1153,7 +1153,9 @@ class AEOPassAgent(BaseAgent):
         # ── 3. Quantifiable claims density ──
         data_points = len(stat_lines)
         data_per_1000 = (data_points / max(word_count, 1)) * 1000
-        low_data = data_per_1000 < 3
+        # Target 3.5 to create buffer — the validator checks at 3.0 and
+        # word count can shift between AEO pass and final validation
+        low_data = data_per_1000 < 3.5
         if low_data:
             issues.append(
                 f"LOW DATA DENSITY: {data_points} quantifiable claims in {word_count} words "
