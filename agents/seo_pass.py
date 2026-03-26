@@ -63,6 +63,7 @@ class SEOPassAgent(BaseAgent):
         """Apply every possible programmatic fix. Returns (article, list_of_fix_dicts)."""
         fixed = []
         self._global_modified_lines = set()  # Track lines modified across all link-insertion calls
+        self._anchor_phrases = self._build_anchor_phrases(state)  # Cluster-informed phrases
 
         # Count links before fixes for detail reporting
         internal_before = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', article))
@@ -331,6 +332,53 @@ class SEOPassAgent(BaseAgent):
         return "\n".join(lines) if modified else None
 
     @staticmethod
+    def _build_anchor_phrases(state: PipelineState) -> list[str]:
+        """Build link anchor phrases from the keyword cluster.
+
+        Extracts meaningful 2-3 word noun phrases from supporting keywords.
+        Result: diverse anchors like "grant compliance," "donor agreements,"
+        "volunteer waivers" instead of every link using "contract management."
+        """
+        # Words that don't add meaning to an anchor phrase
+        skip_words = {
+            "for", "the", "and", "best", "software", "small", "with",
+            "from", "that", "this", "about", "how", "what", "when",
+            "companies", "tools", "systems", "platforms", "solutions",
+        }
+
+        cluster_phrases = []
+        seen = set()
+
+        def add(phrase):
+            p = phrase.lower().strip()
+            if p and p not in seen and 2 <= len(p.split()) <= 3:
+                # Must have at least 2 meaningful words
+                meaningful = [w for w in p.split() if w not in skip_words and len(w) > 2]
+                if len(meaningful) >= 2:
+                    seen.add(p)
+                    cluster_phrases.append(p)
+
+        # Extract from secondary keywords
+        for sk in (state.secondary_keywords or []):
+            words = sk.lower().split()
+            # Try the full keyword first (if short enough)
+            add(sk)
+            # Extract 2-3 word subphrases
+            for length in (3, 2):
+                for i in range(len(words) - length + 1):
+                    add(" ".join(words[i:i + length]))
+
+        # Fallback generic phrases
+        base_phrases = [
+            "contract lifecycle management",
+            "contract compliance", "contract renewal",
+            "contract obligations", "contract deadlines",
+            "contracts", "agreements", "renewals",
+        ]
+
+        return (cluster_phrases + base_phrases)[:30]
+
+    @staticmethod
     def _find_whole_word(phrase: str, text: str) -> int:
         """Find phrase in text at word boundaries. Returns index or -1."""
         start = 0
@@ -498,16 +546,7 @@ class SEOPassAgent(BaseAgent):
                     url = link.get("url", "")
                     if not url:
                         continue
-                    # Find an unlinked sentence containing topic-related phrases
-                    all_internal_phrases = [
-                        "contract lifecycle management",
-                        "contract risk management", "contract management",
-                        "risk management", "contract risk",
-                        "contract renewal", "contract compliance",
-                        "legal teams", "contract terms",
-                        "contract obligations", "contract deadlines",
-                        "contracts", "agreements", "renewals",
-                    ]
+                    all_internal_phrases = self._anchor_phrases
                     placed = False
                     for i, line in enumerate(lines):
                         if i in self._global_modified_lines:
@@ -567,17 +606,7 @@ class SEOPassAgent(BaseAgent):
                                 or len(stripped) < 30):
                             continue
                         low = stripped.lower()
-                        # Wrap common topic phrases with external URLs
-                        # Try multi-word phrases first, then single-word fallbacks
-                        all_phrases = [
-                            "contract lifecycle management", "contract management",
-                            "risk management", "compliance management",
-                            "contract compliance", "compliance programs",
-                            "compliance risk", "legal operations",
-                            "procurement process", "vendor management",
-                            "legal teams", "contract terms",
-                            "business operations", "contract obligations",
-                        ]
+                        all_phrases = self._anchor_phrases
                         placed = False
                         for phrase in all_phrases:
                             idx = self._find_whole_word(phrase, low)

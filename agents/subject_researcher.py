@@ -1,17 +1,19 @@
-"""Agent 2: Subject Matter Researcher - fully programmatic.
+"""Agent 2: Subject Matter Researcher - keyword-by-keyword research.
 
-No LLM calls. Finds and reads authoritative sources to extract verifiable
-facts and statistics. Filters out competitor pages and marketing copy.
+No LLM calls. For each keyword in the cluster, searches for authoritative
+pages, reads them, and extracts facts/stats tagged with the keyword they
+support. This connects each fact to a specific article section and its
+source URL — enabling the writer to cite sources and Agent 10 to link
+the keyword to its research source.
 
-A blog writer researches by finding independent, authoritative sources —
-industry reports, .gov data, nonprofit association studies — and extracting
-specific, verifiable facts with clear attribution. They skip competitor
-product pages and their own company's marketing.
+A blog writer researches each subtopic of their article individually:
+"What data exists about donor agreements?" "What's the compliance picture
+for grant contracts?" They don't just search the head keyword and hope
+for the best.
 """
 
 import re
 from datetime import datetime
-from urllib.parse import urlparse
 from agents.base import BaseAgent
 from state import PipelineState
 from tools.web_search import web_search
@@ -25,238 +27,305 @@ class SubjectResearcherAgent(BaseAgent):
     agent_number = 2
     emoji = "\U0001f4da"
 
-    # Sources a blog writer would skip
     _SKIP_URL_PATTERNS = [
         "/solutions/", "/features/", "/pricing/", "/demo",
         "/product/", "/platform/", "/get-started",
     ]
 
+    # Paywalled market research sites that show metadata but no actual content
+    _SKIP_DOMAINS = [
+        "researchandmarkets.com", "dataintelo.com", "marketintelo.com",
+        "grandviewresearch.com", "mordorintelligence.com",
+        "alliedmarketresearch.com", "precedenceresearch.com",
+        "slashdot.org", "catalog.data.gov",
+    ]
+
+    _MARKETING_SIGNALS = [
+        "click here", "subscribe", "sign up", "cookie", "privacy policy",
+        "terms of service", "all rights reserved", "schedule a demo",
+        "get started", "learn more", "contact us", "free trial",
+        "streamline", "transform", "leverage", "empower", "solution to help",
+        "it's necessary to implement", "wise decision", "certainly a",
+        "beacon", "guiding", "navigate the byways",
+        "content:-", "table of contents", "trusted by",
+        "report description", "table of content", "methodology",
+        "editor:", "report analysis",
+        "director,", "manager,", "you can't go wrong",
+    ]
+
     def run(self, state: PipelineState) -> PipelineState:
-        self.progress("Researching from authoritative sources...")
-        current_year = str(datetime.now().year)
-        kw = state.target_keyword
-
-        # ── Web searches — target authoritative, independent sources ──
-        # A blog writer searches for KNOWN authoritative sources by name,
-        # not generic "statistics" queries that return listicles.
-        search_queries = [
-            # Named authoritative sources
-            f"World Commerce Contracting contract management report cost revenue",
-            f"Nonprofit HR staffing survey {current_year} OR {int(current_year)-1}",
-            f"National Council of Nonprofits compliance contract challenges report",
-            # Government / regulatory
-            f"nonprofit grant compliance audit statistics site:gao.gov OR site:gov",
-            # Industry data
-            f"contract management market report nonprofit {current_year}",
-            # Topic-specific research
-            f"{kw} statistics survey research",
-        ]
-
-        # If keyword cluster identified content gaps, search for data on those
-        cluster = state.keyword_cluster or {}
-        for gap in cluster.get("content_gaps", [])[:3]:
-            gap_topic = gap.get("topic", "")
-            if gap_topic:
-                search_queries.append(f"{gap_topic} statistics report nonprofit")
-
-        if state.additional_instructions:
-            search_queries.append(f"{kw} {state.additional_instructions}")
-
-        all_search_results = []
-        for query in search_queries:
-            self.progress(f"Searching: {query}")
-            results = web_search(query)
-            all_search_results.extend(results)
-
-        # Deduplicate by URL
-        seen_urls = set()
-        unique_results = []
-        for r in all_search_results:
-            url = r.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                unique_results.append(r)
-
-        # ── Filter out competitor pages, our own marketing, and product pages ──
-        filtered_results = []
-        for r in unique_results:
-            url = r.get("url", "")
-            if not url:
-                continue
-            # Skip competitor domains
-            if is_blocked(url):
-                self.progress(f"  Skipping competitor: {url[:60]}")
-                continue
-            # Skip our own marketing (not independent research)
-            if is_internal(url):
-                self.progress(f"  Skipping own site: {url[:60]}")
-                continue
-            # Skip product/solution pages (marketing, not research)
-            if any(p in url.lower() for p in self._SKIP_URL_PATTERNS):
-                self.progress(f"  Skipping product page: {url[:60]}")
-                continue
-            filtered_results.append(r)
-
-        self.progress(f"Filtered to {len(filtered_results)} independent sources (from {len(unique_results)} total)")
-
-        # ── Score and fetch top pages ──
+        self.progress("Researching each keyword topic from authoritative sources...")
         topic_words = self._get_topic_words(state)
 
-        def snippet_relevance(result):
-            text = (result.get("snippet", "") + " " + result.get("title", "")).lower()
-            return sum(1 for w in topic_words if w in text)
+        # ── Phase 1: Keyword-by-keyword research ──
+        # Each cluster keyword is a research assignment.
+        cluster = state.keyword_cluster or {}
+        supporting_kws = [
+            kw.get("keyword", "") for kw in cluster.get("supporting_keywords", [])
+            if kw.get("keyword")
+        ]
 
-        scored = sorted(filtered_results, key=snippet_relevance, reverse=True)
-        fetch_targets = scored[:5]  # Fetch more pages for better research coverage
+        all_statistics = []
+        all_key_facts = []
+        all_pages_read = []  # Track every page we read for the research summary
+        fetched_urls = set()
 
-        fetched_pages = []
-        for r in fetch_targets:
-            url = r["url"]
-            self.progress(f"Reading: {url[:80]}...")
-            data = web_fetch(url)
-            if data.get("content") and not data.get("error"):
-                fetched_pages.append({
-                    "url": url,
-                    "title": r.get("title", "Unknown"),
-                    "content": data["content"][:8000],
-                })
-
-        # ── Extract statistics programmatically ──
-        self.progress("Extracting statistics from sources...")
-        statistics = []
-        for page in fetched_pages:
-            page_stats = self._extract_statistics(
-                page["content"], page["url"], page["title"], topic_words
+        # Research each supporting keyword individually
+        for kw in supporting_kws[:8]:
+            kw_stats, kw_facts, kw_pages = self._research_keyword(
+                kw, topic_words, fetched_urls
             )
-            statistics.extend(page_stats)
+            all_statistics.extend(kw_stats)
+            all_key_facts.extend(kw_facts)
+            all_pages_read.extend(kw_pages)
 
-        # Also extract from search snippets (often contain key stats)
-        for r in unique_results[:15]:
-            snippet = r.get("snippet", "")
-            if snippet:
-                snippet_stats = self._extract_statistics(
-                    snippet, r.get("url", ""), r.get("title", ""), topic_words
-                )
-                for s in snippet_stats:
-                    # Deduplicate by checking if the stat text is already captured
-                    if not any(s["stat"][:30] in existing["stat"] for existing in statistics):
-                        statistics.append(s)
+        # ── Phase 2: General topic research ──
+        # Broader searches for stats that don't map to a specific keyword
+        general_stats, general_facts, general_pages = self._research_general(
+            state, topic_words, fetched_urls
+        )
+        all_statistics.extend(general_stats)
+        all_key_facts.extend(general_facts)
+        all_pages_read.extend(general_pages)
 
-        # ── Extract key facts programmatically ──
-        self.progress("Extracting key facts from sources...")
-        key_facts = []
-        for page in fetched_pages:
-            page_facts = self._extract_key_facts(page["content"], page["url"], topic_words)
-            key_facts.extend(page_facts)
-
-        # ── Build research summary ──
-        research_parts = [f"# Subject Research: {state.topic}\n"]
-
-        # Search results overview
-        research_parts.append("## Sources Analyzed")
-        for r in unique_results[:10]:
-            research_parts.append(f"- [{r.get('title', 'Untitled')}]({r.get('url', '')})")
-            if r.get("snippet"):
-                research_parts.append(f"  {r['snippet'][:150]}")
-        research_parts.append("")
-
-        # Key facts
-        if key_facts:
-            research_parts.append("## Key Facts")
-            for fact in key_facts:
-                source = fact.get("source", "")
-                research_parts.append(f"- {fact['fact']}" + (f" (Source: {source})" if source else ""))
-            research_parts.append("")
-
-        # Statistics
-        if statistics:
-            research_parts.append("## Statistics")
-            for stat in statistics:
-                source = stat.get("source_name", "")
-                research_parts.append(f"- {stat['stat']}" + (f" — {source}" if source else ""))
-            research_parts.append("")
-
-        # Relevant excerpts from fetched pages
-        if fetched_pages:
-            research_parts.append("## Source Excerpts")
-            for page in fetched_pages:
-                relevant = self._extract_relevant_passages(page["content"], topic_words)
-                if relevant:
-                    research_parts.append(f"\n### {page['title']}")
-                    research_parts.append(f"URL: {page['url']}")
-                    research_parts.append(relevant)
-            research_parts.append("")
+        # ── Deduplicate ──
+        all_statistics = self._dedup_stats(all_statistics)
+        all_key_facts = self._dedup_facts(all_key_facts)
 
         # ── Deprioritize previously-cited stats ──
-        # Read the ledger of stats already used in other articles.
-        # Move previously-cited stats to the end so the writer sees fresh data first.
         previously_cited = self._load_cited_stats()
-        if previously_cited and statistics:
+        if previously_cited and all_statistics:
             new_stats = []
             reused_stats = []
-            for s in statistics:
+            for s in all_statistics:
                 stat_text = s.get("stat", "").lower()[:80]
-                is_reused = any(cited in stat_text or stat_text in cited for cited in previously_cited)
+                is_reused = any(
+                    cited in stat_text or stat_text in cited
+                    for cited in previously_cited
+                )
                 if is_reused:
                     reused_stats.append(s)
                 else:
                     new_stats.append(s)
             if reused_stats:
-                self.progress(f"Deprioritized {len(reused_stats)} previously-cited stats (new stats shown first)")
-            statistics = new_stats + reused_stats
+                self.progress(
+                    f"Deprioritized {len(reused_stats)} previously-cited stats"
+                )
+            all_statistics = new_stats + reused_stats
+
+        # ── Build research summary ──
+        research_parts = self._build_research_summary(
+            state, all_statistics, all_key_facts, all_pages_read
+        )
 
         state.subject_research = "\n".join(research_parts)
-        state.key_facts = key_facts[:15]
-        state.statistics = statistics[:10]
+        state.key_facts = all_key_facts[:15]
+        state.statistics = all_statistics[:12]
 
-        self.log(f"Found {len(key_facts)} key facts and {len(statistics)} statistics "
-                 f"({len([s for s in statistics[:10] if s not in (reused_stats if previously_cited else [])])} new)")
+        # Report coverage
+        kws_with_data = set()
+        for s in all_statistics:
+            if s.get("keyword"):
+                kws_with_data.add(s["keyword"])
+        for f in all_key_facts:
+            if f.get("keyword"):
+                kws_with_data.add(f["keyword"])
+
+        self.log(
+            f"Found {len(all_key_facts)} facts and {len(all_statistics)} stats "
+            f"covering {len(kws_with_data)}/{len(supporting_kws[:8])} cluster keywords"
+        )
         return state
 
-    def _load_cited_stats(self) -> list[str]:
-        """Load previously-cited stat fingerprints from the ledger."""
-        from config import KNOWLEDGE_DIR
-        ledger_path = KNOWLEDGE_DIR / "cited_stats.md"
-        if not ledger_path.exists():
-            return []
-        try:
-            content = ledger_path.read_text()
-            # Extract stat text from ledger lines: "stat text | source | slug | date"
-            stats = []
-            for line in content.split("\n"):
-                line = line.strip()
-                if line and not line.startswith("#") and not line.startswith("<!--") and "|" in line:
-                    stat_text = line.split("|")[0].strip().lower()[:80]
-                    if stat_text:
-                        stats.append(stat_text)
-            return stats
-        except Exception:
-            return []
+    # ══════════════════════════════════════════════════════════════
+    # KEYWORD-BY-KEYWORD RESEARCH
+    # ══════════════════════════════════════════════════════════════
 
-    def _get_topic_words(self, state: PipelineState) -> set[str]:
-        """Extract meaningful words from topic and keyword."""
-        stopwords = {
-            "a", "an", "the", "and", "or", "but", "for", "of", "to", "in",
-            "on", "at", "by", "is", "are", "was", "were", "be", "been",
-            "your", "our", "their", "this", "that", "with", "how", "what",
-            "why", "when", "best", "top", "guide", "tips", "practices",
-        }
-        words = set()
-        for text in [state.topic, state.target_keyword]:
-            for w in re.findall(r"[a-z]+", text.lower()):
-                if len(w) > 3 and w not in stopwords:
-                    words.add(w)
-        return words
+    def _research_keyword(
+        self, keyword: str, topic_words: set[str], fetched_urls: set
+    ) -> tuple[list, list, list]:
+        """Research a single keyword: search, fetch, read, extract facts."""
+        self.progress(f"Researching: \"{keyword}\"")
+
+        # Build keyword-specific search query
+        # Strip generic modifiers to get the core topic
+        core = re.sub(
+            r'\b(best|software|tools?|platform|management|for|small|nonprofits?)\b',
+            '', keyword, flags=re.IGNORECASE,
+        ).strip()
+        core = re.sub(r'\s+', ' ', core).strip()
+        if len(core) < 4:
+            core = keyword  # Fallback to full keyword if core is too short
+
+        search_queries = [
+            f"{keyword} statistics research report",
+            f"{core} nonprofit data survey",
+        ]
+
+        # Search
+        results = []
+        for query in search_queries:
+            self.progress(f"  Searching: {query}")
+            search_results = web_search(query)
+            results.extend(search_results)
+
+        # Filter
+        filtered = self._filter_results(results, fetched_urls)
+
+        if not filtered:
+            self.progress(f"  No independent sources found for \"{keyword}\"")
+            return [], [], []
+
+        # Fetch and read top 1-2 pages for this keyword
+        keyword_topic_words = topic_words | set(
+            w for w in re.findall(r'[a-z]+', keyword.lower()) if len(w) > 3
+        )
+
+        stats = []
+        facts = []
+        pages = []
+
+        for r in filtered[:2]:
+            url = r["url"]
+            if url in fetched_urls:
+                continue
+            fetched_urls.add(url)
+
+            self.progress(f"  Reading: {url[:70]}...")
+            data = web_fetch(url)
+            if not data.get("content") or data.get("error"):
+                continue
+
+            content = data["content"][:8000]
+            title = r.get("title", "Unknown")
+
+            pages.append({"url": url, "title": title, "keyword": keyword})
+
+            # Extract stats tagged with this keyword
+            page_stats = self._extract_statistics(
+                content, url, title, keyword_topic_words
+            )
+            for s in page_stats:
+                s["keyword"] = keyword
+            stats.extend(page_stats)
+
+            # Extract facts tagged with this keyword
+            page_facts = self._extract_key_facts(
+                content, url, keyword_topic_words
+            )
+            for f in page_facts:
+                f["keyword"] = keyword
+            facts.extend(page_facts)
+
+        found = len(stats) + len(facts)
+        if found > 0:
+            self.progress(f"  Found {len(stats)} stats, {len(facts)} facts for \"{keyword}\"")
+        else:
+            self.progress(f"  No usable data found for \"{keyword}\"")
+
+        return stats, facts, pages
+
+    def _research_general(
+        self, state: PipelineState, topic_words: set[str], fetched_urls: set
+    ) -> tuple[list, list, list]:
+        """Broader research not tied to a specific keyword."""
+        self.progress("General topic research...")
+        current_year = str(datetime.now().year)
+
+        search_queries = [
+            f"World Commerce Contracting contract management report cost revenue",
+            f"Nonprofit HR staffing survey {current_year} OR {int(current_year)-1}",
+            f"National Council of Nonprofits compliance challenges report",
+            f"nonprofit grant compliance audit statistics",
+        ]
+
+        if state.additional_instructions:
+            search_queries.append(
+                f"{state.target_keyword} {state.additional_instructions}"
+            )
+
+        results = []
+        for query in search_queries:
+            self.progress(f"  Searching: {query}")
+            results.extend(web_search(query))
+
+        filtered = self._filter_results(results, fetched_urls)
+
+        stats = []
+        facts = []
+        pages = []
+
+        for r in filtered[:3]:
+            url = r["url"]
+            if url in fetched_urls:
+                continue
+            fetched_urls.add(url)
+
+            self.progress(f"  Reading: {url[:70]}...")
+            data = web_fetch(url)
+            if not data.get("content") or data.get("error"):
+                continue
+
+            content = data["content"][:8000]
+            title = r.get("title", "Unknown")
+
+            pages.append({"url": url, "title": title, "keyword": "general"})
+
+            page_stats = self._extract_statistics(content, url, title, topic_words)
+            for s in page_stats:
+                s["keyword"] = "general"
+            stats.extend(page_stats)
+
+            page_facts = self._extract_key_facts(content, url, topic_words)
+            for f in page_facts:
+                f["keyword"] = "general"
+            facts.extend(page_facts)
+
+        return stats, facts, pages
+
+    # ══════════════════════════════════════════════════════════════
+    # FILTERING AND EXTRACTION
+    # ══════════════════════════════════════════════════════════════
+
+    def _filter_results(self, results: list, already_fetched: set) -> list:
+        """Filter search results: no competitors, no own site, no product pages."""
+        seen_urls = set()
+        filtered = []
+        for r in results:
+            url = r.get("url", "")
+            if not url or url in seen_urls or url in already_fetched:
+                continue
+            seen_urls.add(url)
+            if is_blocked(url) or is_internal(url):
+                continue
+            if any(p in url.lower() for p in self._SKIP_URL_PATTERNS):
+                continue
+            # Skip paywalled market research and data catalogs
+            domain = url.split("/")[2].replace("www.", "") if "/" in url[8:] else ""
+            if any(d in domain for d in self._SKIP_DOMAINS):
+                continue
+            filtered.append(r)
+
+        # Sort by snippet relevance (basic — prefer results with stats/data signals)
+        def data_signal(r):
+            text = (r.get("snippet", "") + " " + r.get("title", "")).lower()
+            score = 0
+            if any(w in text for w in ["report", "survey", "study", "research", "found that"]):
+                score += 3
+            if re.search(r'\d+%|\$[\d,]+|\d+\s*(billion|million)', text):
+                score += 2
+            if any(w in text for w in [".gov", ".edu", ".org", "gartner", "forrester"]):
+                score += 2
+            return score
+
+        filtered.sort(key=data_signal, reverse=True)
+        return filtered
 
     def _extract_statistics(
-        self, text: str, source_url: str, source_name: str, topic_words: set[str] = None
+        self, text: str, source_url: str, source_name: str,
+        topic_words: set[str] = None
     ) -> list[dict]:
-        """Extract statistics that are actually about our topic.
-
-        A blog writer only uses stats from pages they've read that are
-        directly relevant to the article's subject. A stat about "CRM market
-        size" should not appear in a contract management article.
-        """
+        """Extract statistics that are actually about our topic."""
         stats = []
         sentences = re.split(r"(?<=[.!?])\s+", text)
 
@@ -266,8 +335,9 @@ class SubjectResearcherAgent(BaseAgent):
                 continue
 
             has_stat = bool(re.search(
-                r"\d+(?:\.\d+)?%|\$[\d,.]+\s*(?:billion|million|trillion)?|\d+\s*(?:billion|million|trillion|percent)",
-                clean, re.IGNORECASE
+                r"\d+(?:\.\d+)?%|\$[\d,.]+\s*(?:billion|million|trillion)?"
+                r"|\d+\s*(?:billion|million|trillion|percent)",
+                clean, re.IGNORECASE,
             ))
 
             if has_stat:
@@ -275,7 +345,6 @@ class SubjectResearcherAgent(BaseAgent):
                 if stat_text and len(stat_text.split()) >= 5:
                     stat_lower = stat_text.lower()
 
-                    # Skip marketing language in stats
                     if any(s in stat_lower for s in [
                         "state-of-the-art", "comprehensive", "cutting-edge",
                         "industry-leading", "best-in-class", "download free",
@@ -283,9 +352,10 @@ class SubjectResearcherAgent(BaseAgent):
                     ]):
                         continue
 
-                    # The stat text itself must be about our topic
                     if topic_words:
-                        topic_matches = sum(1 for w in topic_words if w in stat_lower)
+                        topic_matches = sum(
+                            1 for w in topic_words if w in stat_lower
+                        )
                         if topic_matches < 2:
                             continue
 
@@ -300,62 +370,33 @@ class SubjectResearcherAgent(BaseAgent):
 
         return stats
 
-    def _extract_key_facts(self, text: str, source_url: str, topic_words: set[str]) -> list[dict]:
-        """Extract verifiable factual statements from authoritative sources.
-
-        A blog writer extracts FACTS — verifiable claims with specific details.
-        Not marketing copy ("streamline your workflow"), not opinions
-        ("it's necessary to implement"), not table-of-contents entries.
-        """
+    def _extract_key_facts(
+        self, text: str, source_url: str, topic_words: set[str]
+    ) -> list[dict]:
+        """Extract verifiable factual statements, not marketing copy."""
         facts = []
         sentences = re.split(r"(?<=[.!?])\s+", text)
-
-        # Marketing language signals — these indicate the sentence is selling,
-        # not stating facts
-        marketing_signals = [
-            "click here", "subscribe", "sign up", "cookie", "privacy policy",
-            "terms of service", "all rights reserved", "schedule a demo",
-            "get started", "learn more", "contact us", "free trial",
-            # Sales language
-            "streamline", "transform", "leverage", "empower", "solution to help",
-            "it's necessary to implement", "wise decision", "certainly a",
-            "beacon", "guiding", "navigate the byways",
-            # UI/navigation
-            "content:-", "table of contents", "trusted by",
-            # Testimonials
-            "director,", "manager,", "you can't go wrong",
-        ]
 
         for sentence in sentences:
             clean = sentence.strip()
             if not clean or len(clean) < 30:
                 continue
-
-            # Skip headings, list formatting, table of contents
             if clean.startswith("#") or clean.startswith("|") or clean.startswith("-"):
                 continue
 
             lower = clean.lower()
-
-            # Skip marketing copy
-            if any(signal in lower for signal in marketing_signals):
+            if any(signal in lower for signal in self._MARKETING_SIGNALS):
                 continue
-
-            # Must be a declarative sentence (not a question)
             if clean.endswith("?"):
                 continue
 
-            # Score by topic word matches
             matches = sum(1 for w in topic_words if w in lower)
-
-            # Must have 3+ topic word matches
             if matches < 3:
                 continue
 
-            # Prefer sentences with specific details: named sources, years, numbers
             has_specifics = bool(re.search(
                 r'\d{4}|\d+%|\$[\d,]+|according to|report|survey|study|found that',
-                clean, re.IGNORECASE
+                clean, re.IGNORECASE,
             ))
 
             facts.append({
@@ -364,28 +405,103 @@ class SubjectResearcherAgent(BaseAgent):
                 "relevance": matches + (2 if has_specifics else 0),
             })
 
-            if len(facts) >= 5:
+            if len(facts) >= 3:  # Fewer per source to encourage diversity
                 break
 
         facts.sort(key=lambda f: f["relevance"], reverse=True)
         return facts
 
-    def _extract_relevant_passages(self, content: str, topic_words: set[str]) -> str:
-        """Extract the most relevant paragraphs from a page."""
-        paragraphs = content.split("\n\n")
-        relevant = []
+    # ══════════════════════════════════════════════════════════════
+    # DEDUP AND HELPERS
+    # ══════════════════════════════════════════════════════════════
 
-        for para in paragraphs:
-            para = para.strip()
-            if not para or para.startswith("#") or len(para) < 50:
-                continue
+    def _dedup_stats(self, stats: list[dict]) -> list[dict]:
+        seen = set()
+        deduped = []
+        for s in stats:
+            fingerprint = s.get("stat", "")[:40].lower()
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                deduped.append(s)
+        return deduped
 
-            lower = para.lower()
-            matches = sum(1 for w in topic_words if w in lower)
-            if matches >= 3:
-                relevant.append(para[:300])
+    def _dedup_facts(self, facts: list[dict]) -> list[dict]:
+        seen = set()
+        deduped = []
+        for f in facts:
+            fingerprint = f.get("fact", "")[:40].lower()
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                deduped.append(f)
+        return deduped
 
-            if len(relevant) >= 3:
-                break
+    def _get_topic_words(self, state: PipelineState) -> set[str]:
+        stopwords = {
+            "a", "an", "the", "and", "or", "but", "for", "of", "to", "in",
+            "on", "at", "by", "is", "are", "was", "were", "be", "been",
+            "your", "our", "their", "this", "that", "with", "how", "what",
+            "why", "when", "best", "top", "guide", "tips", "practices",
+        }
+        words = set()
+        for text in [state.topic, state.target_keyword]:
+            for w in re.findall(r"[a-z]+", text.lower()):
+                if len(w) > 3 and w not in stopwords:
+                    words.add(w)
+        return words
 
-        return "\n\n".join(relevant) if relevant else ""
+    def _load_cited_stats(self) -> list[str]:
+        from config import KNOWLEDGE_DIR
+        ledger_path = KNOWLEDGE_DIR / "cited_stats.md"
+        if not ledger_path.exists():
+            return []
+        try:
+            content = ledger_path.read_text()
+            stats = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("<!--") and "|" in line:
+                    stat_text = line.split("|")[0].strip().lower()[:80]
+                    if stat_text:
+                        stats.append(stat_text)
+            return stats
+        except Exception:
+            return []
+
+    def _build_research_summary(self, state, statistics, key_facts, pages_read):
+        """Build human-readable research summary organized by keyword."""
+        parts = [f"# Subject Research: {state.topic}\n"]
+
+        # Organize by keyword
+        kw_data = {}
+        for s in statistics:
+            kw = s.get("keyword", "general")
+            kw_data.setdefault(kw, {"stats": [], "facts": [], "sources": []})
+            kw_data[kw]["stats"].append(s)
+        for f in key_facts:
+            kw = f.get("keyword", "general")
+            kw_data.setdefault(kw, {"stats": [], "facts": [], "sources": []})
+            kw_data[kw]["facts"].append(f)
+        for p in pages_read:
+            kw = p.get("keyword", "general")
+            kw_data.setdefault(kw, {"stats": [], "facts": [], "sources": []})
+            kw_data[kw]["sources"].append(p)
+
+        for kw, data in kw_data.items():
+            parts.append(f"\n## Research: {kw}")
+            if data["sources"]:
+                parts.append("Sources read:")
+                for p in data["sources"]:
+                    parts.append(f"  - [{p['title'][:60]}]({p['url']})")
+            if data["stats"]:
+                parts.append("Statistics found:")
+                for s in data["stats"]:
+                    parts.append(f"  - {s['stat'][:120]} ({s.get('source_name', '')})")
+            if data["facts"]:
+                parts.append("Key facts:")
+                for f in data["facts"]:
+                    parts.append(f"  - {f['fact'][:120]}")
+            if not data["stats"] and not data["facts"]:
+                parts.append("  (No usable data found for this keyword)")
+            parts.append("")
+
+        return parts
