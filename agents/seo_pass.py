@@ -71,7 +71,13 @@ class SEOPassAgent(BaseAgent):
         internal_before = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', article))
         external_before = len(re.findall(r'\[.*?\]\(https?://[^)]+\)', article)) - internal_before
 
-        # Process link insertion FIRST (before keyword destuffing, which removes anchor points)
+        # Link stat sentences to their research sources FIRST —
+        # a journalist links every cited stat to where it came from
+        article, stat_links_added = self._fix_stat_source_links(article, state)
+        if stat_links_added:
+            fixed.extend(stat_links_added)
+
+        # Then process remaining link issues
         link_issues = [i for i in issues if ("INTERNAL LINKS" in i or "EXTERNAL LINKS" in i) and "ONLY" in i]
         other_issues = [i for i in issues if i not in link_issues]
         for issue in link_issues + other_issues:
@@ -440,6 +446,102 @@ class SEOPassAgent(BaseAgent):
                 start = idx + 1
                 continue
             return idx
+
+    def _fix_stat_source_links(self, article: str, state: PipelineState) -> tuple[str, list[dict]]:
+        """Link stat sentences to their research source URLs.
+
+        A journalist links every cited stat to its source. If the article says
+        '80% of nonprofits report X' and the research says that stat came from
+        nonprofitpro.com, the sentence should link to that URL.
+        """
+        from link_policy import is_blocked, is_internal
+
+        if not state.statistics:
+            return article, []
+
+        lines = article.split("\n")
+        fixed = []
+        linked_urls = set()
+
+        for stat in state.statistics:
+            url = stat.get("source_url", "")
+            if not url or is_blocked(url) or is_internal(url):
+                continue
+            if url.lower() in linked_urls:
+                continue
+
+            # Extract key percentages from the stat
+            stat_text = stat.get("stat", "")
+            stat_numbers = set(re.findall(r'\d+(?:\.\d+)?%', stat_text))
+            if not stat_numbers:
+                continue
+
+            source_name = stat.get("source_name", "").strip()
+
+            # Find the article line that uses this stat's numbers
+            for i, line in enumerate(lines):
+                if i in self._global_modified_lines:
+                    continue
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+                    continue
+                if stripped.count("](") >= 2:
+                    continue  # Already has enough links
+                if url.lower().rstrip("/") in stripped.lower():
+                    continue  # Already linked to this URL
+
+                line_numbers = set(re.findall(r'\d+(?:\.\d+)?%', stripped))
+                matching = stat_numbers & line_numbers
+                if not matching:
+                    continue
+
+                # This line cites the stat — link it to the source
+                low = stripped.lower()
+
+                # Strategy 1: wrap the source name if it appears
+                if source_name and len(source_name) > 3:
+                    # Try to find source name (or partial) in the line
+                    src_lower = source_name.lower()
+                    src_words = source_name.split()
+                    # Try full name, then first 2-3 words
+                    for try_name in [source_name] + [" ".join(src_words[:3]), " ".join(src_words[:2])]:
+                        idx = self._find_whole_word(try_name.lower(), low)
+                        if idx >= 0 and f"[{try_name.lower()}" not in low:
+                            original = stripped[idx:idx + len(try_name)]
+                            new_line = stripped[:idx] + f"[{original}]({url})" + stripped[idx + len(try_name):]
+                            lines[i] = line.replace(stripped, new_line)
+                            self._global_modified_lines.add(i)
+                            linked_urls.add(url.lower())
+                            fixed.append({"change": "stat_source_link", "detail": f"Linked '{original}' to research source {url[:50]}"})
+                            break
+                    else:
+                        # Strategy 2: wrap "according to" + nearby text, or "survey/report/research"
+                        for trigger in ["according to a recent survey", "according to a recent", "according to industry research", "according to research", "survey", "report", "research shows"]:
+                            idx = self._find_whole_word(trigger, low)
+                            if idx >= 0 and f"[{trigger}" not in low:
+                                original = stripped[idx:idx + len(trigger)]
+                                new_line = stripped[:idx] + f"[{original}]({url})" + stripped[idx + len(trigger):]
+                                lines[i] = line.replace(stripped, new_line)
+                                self._global_modified_lines.add(i)
+                                linked_urls.add(url.lower())
+                                fixed.append({"change": "stat_source_link", "detail": f"Linked '{original}' to research source {url[:50]}"})
+                                break
+                    break  # Move to next stat after finding its line
+                else:
+                    # No source name — try wrapping attribution phrases
+                    for trigger in ["according to a recent survey", "according to a recent", "according to industry research", "survey", "report"]:
+                        idx = self._find_whole_word(trigger, low)
+                        if idx >= 0 and f"[{trigger}" not in low:
+                            original = stripped[idx:idx + len(trigger)]
+                            new_line = stripped[:idx] + f"[{original}]({url})" + stripped[idx + len(trigger):]
+                            lines[i] = line.replace(stripped, new_line)
+                            self._global_modified_lines.add(i)
+                            linked_urls.add(url.lower())
+                            fixed.append({"change": "stat_source_link", "detail": f"Linked '{original}' to research source {url[:50]}"})
+                            break
+                    break
+
+        return "\n".join(lines), fixed
 
     def _dedup_existing_links(self, article: str) -> str:
         """Remove duplicate link URLs already in the article from the writer.
