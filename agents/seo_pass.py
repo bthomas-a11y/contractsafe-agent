@@ -34,9 +34,16 @@ class SEOPassAgent(BaseAgent):
         for issue in issues:
             self.progress(f"  - {issue[:100]}")
 
-        # ── Fix everything programmatically ──
-        self.progress("Inserting internal and external links programmatically...")
+        # ── Fix programmatic issues (keyword density, heading structure) ──
+        self.progress("Fixing keyword and heading issues...")
         article, fixed = self._apply_all_fixes(article, issues, state)
+
+        # ── Place links with Sonnet (comprehension, not pattern matching) ──
+        link_issues = [i for i in issues if "INTERNAL LINKS" in i or "EXTERNAL LINKS" in i]
+        if link_issues:
+            self.progress("Placing links with Sonnet (reading article + link candidates)...")
+            article, link_fixed = self._place_links_with_llm(article, state)
+            fixed.extend(link_fixed)
 
         # ── Dedup again after link insertion (may have added duplicate URLs) ──
         article = self._dedup_existing_links(article)
@@ -71,16 +78,9 @@ class SEOPassAgent(BaseAgent):
         internal_before = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', article))
         external_before = len(re.findall(r'\[.*?\]\(https?://[^)]+\)', article)) - internal_before
 
-        # Link stat sentences to their research sources FIRST —
-        # a journalist links every cited stat to where it came from
-        article, stat_links_added = self._fix_stat_source_links(article, state)
-        if stat_links_added:
-            fixed.extend(stat_links_added)
-
-        # Then process remaining link issues
-        link_issues = [i for i in issues if ("INTERNAL LINKS" in i or "EXTERNAL LINKS" in i) and "ONLY" in i]
-        other_issues = [i for i in issues if i not in link_issues]
-        for issue in link_issues + other_issues:
+        # Process non-link issues only (links are handled by _place_links_with_llm)
+        non_link_issues = [i for i in issues if "INTERNAL LINKS" not in i and "EXTERNAL LINKS" not in i and "FRONT-LOADED" not in i]
+        for issue in non_link_issues:
             if "KEYWORD NOT IN ANY H2" in issue:
                 result = self._fix_keyword_in_h2(article, state.target_keyword)
                 if result:
@@ -105,27 +105,8 @@ class SEOPassAgent(BaseAgent):
                     article = result
                     fixed.append({"change": "secondary_keywords", "detail": f"Inserted secondary keywords: {', '.join(state.secondary_keywords[:5])}"})
 
-            elif "INTERNAL LINKS" in issue and "ONLY" in issue:
-                result = self._fix_add_links(article, state.internal_links, "internal")
-                if result:
-                    article = result
-                    new_count = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', result))
-                    added = new_count - internal_before
-                    fixed.append({"change": "add_internal_links", "detail": f"Inserted {added} internal links to contractsafe.com pages"})
-
-            elif "EXTERNAL LINKS" in issue and "ONLY" in issue:
-                result = self._fix_add_links(article, state.external_links, "external")
-                if result:
-                    article = result
-                    new_ext = len(re.findall(r'\[.*?\]\(https?://[^)]+\)', result)) - len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', result))
-                    added = new_ext - external_before
-                    fixed.append({"change": "add_external_links", "detail": f"Inserted {added} external links to authoritative sources"})
-
-            elif "LINKS NOT FRONT-LOADED" in issue:
-                result = self._fix_front_loading(article, state)
-                if result:
-                    article = result
-                    fixed.append({"change": "link_front_loading", "detail": "Redistributed links toward the first third of the article"})
+            # Link issues (INTERNAL/EXTERNAL/FRONT-LOADED) are handled by
+            # _place_links_with_llm, not here.
 
             elif "NAKED URLs" in issue:
                 result = self._fix_naked_urls(article)
@@ -575,6 +556,151 @@ class SEOPassAgent(BaseAgent):
                     break
 
         return "\n".join(lines), fixed
+
+    def _place_links_with_llm(self, article: str, state: PipelineState) -> tuple[str, list[dict]]:
+        """Use Sonnet to decide link placement — comprehension, not pattern matching.
+
+        Sonnet sees a COMPACT article summary (H2s + first sentence each) and
+        the available links. It returns a JSON plan: which link goes in which
+        section with what anchor text. Python does the actual text insertion.
+
+        This keeps the prompt under 5K chars and the call under 60s.
+        """
+        from link_policy import is_blocked
+
+        existing_urls = set(
+            u.lower() for _, u in re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', article)
+        )
+
+        # Build compact article summary: H2 + first body sentence
+        sections = []
+        current_h2 = "Introduction"
+        current_first = ""
+        for line in article.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                if current_first:
+                    sections.append(f"[{current_h2}] {current_first}")
+                current_h2 = stripped[3:]
+                current_first = ""
+            elif stripped and not current_first and not stripped.startswith("#") and not stripped.startswith("|") and not stripped.startswith("-"):
+                current_first = stripped[:150]
+        if current_first:
+            sections.append(f"[{current_h2}] {current_first}")
+        summary = "\n".join(sections)
+
+        # Build link menus
+        links_menu = []
+        link_map = {}  # id -> url for JSON parsing
+        idx = 1
+        for l in (state.internal_links or [])[:8]:
+            url = l.get("url", "")
+            if url.lower() in existing_urls or is_blocked(url):
+                continue
+            links_menu.append(f"L{idx}: [INT] {l.get('title', '')[:50]} | {url}")
+            link_map[f"L{idx}"] = url
+            idx += 1
+        for l in (state.external_links or [])[:6]:
+            url = l.get("url", "")
+            if url.lower() in existing_urls or is_blocked(url):
+                continue
+            rel = l.get("relevance_summary", "")[:40]
+            links_menu.append(f"L{idx}: [EXT] {l.get('title', '')[:50]} | {url}" + (f" | {rel}" if rel else ""))
+            link_map[f"L{idx}"] = url
+            idx += 1
+        # Add stat sources
+        for s in (state.statistics or [])[:6]:
+            url = s.get("source_url", "")
+            name = s.get("source_name", "")
+            if url and name and not is_blocked(url) and url.lower() not in existing_urls:
+                stat_num = re.findall(r'\d+(?:\.\d+)?%', s.get("stat", ""))
+                stat_hint = f" (stat: {stat_num[0]})" if stat_num else ""
+                links_menu.append(f"L{idx}: [SRC] {name}{stat_hint} | {url}")
+                link_map[f"L{idx}"] = url
+                idx += 1
+
+        if not link_map:
+            return article, []
+
+        system_prompt = (
+            "You are a link placement editor. Given an article summary and available links, "
+            "output a JSON array of link placements. Each placement specifies which text to "
+            "wrap as a link. The anchor text MUST describe the destination page.\n\n"
+            "Rules:\n"
+            "- Place 5+ internal and 3+ external links\n"
+            "- Anchor = 2-5 words that describe the destination, taken from the article text\n"
+            "- For stat sources [SRC], place near the sentence citing that stat\n"
+            "- One link per sentence. Don't link headings.\n"
+            "- Output ONLY a JSON array, no other text."
+        )
+
+        user_prompt = (
+            f"ARTICLE SUMMARY:\n{summary}\n\n"
+            f"AVAILABLE LINKS:\n" + "\n".join(links_menu) + "\n\n"
+            "Output a JSON array of objects with fields:\n"
+            '- "link_id": "L1" etc.\n'
+            '- "anchor": exact 2-5 words from the article to wrap as the link\n'
+            '- "section": which H2 section this goes in\n\n'
+            "Example: [{\"link_id\": \"L1\", \"anchor\": \"stages of contract management\", \"section\": \"Why Nonprofit...\"}]"
+        )
+
+        # Use Haiku for speed — this is a matching task, not deep reasoning.
+        # Save and restore model to avoid changing the agent's default.
+        original_model = self.model
+        original_timeout = self.timeout
+        self.model = "haiku"
+        self.timeout = 90  # CLI overhead ~20-30s + Haiku generation ~10-20s
+        try:
+            result = self.call_llm_json(system_prompt, user_prompt)
+        finally:
+            self.model = original_model
+            self.timeout = original_timeout
+
+        if not result or isinstance(result, dict) and "raw_response" in result:
+            self.log("[yellow]Sonnet link placement returned unparseable response[/yellow]")
+            return article, []
+
+        placements = result if isinstance(result, list) else result.get("placements", result.get("links", []))
+        if not isinstance(placements, list):
+            return article, []
+
+        # Apply placements
+        lines = article.split("\n")
+        fixed = []
+        placed_urls = set()
+
+        for p in placements:
+            link_id = p.get("link_id", "")
+            anchor = p.get("anchor", "")
+            url = link_map.get(link_id, "")
+
+            if not url or not anchor or url.lower() in placed_urls:
+                continue
+
+            # Find and wrap the anchor text in the article
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+                    continue
+                if stripped.count("](") >= 2:
+                    continue
+
+                low = stripped.lower()
+                anchor_low = anchor.lower()
+
+                idx = self._find_whole_word(anchor_low, low)
+                if idx >= 0 and f"[{anchor_low}" not in low:
+                    original = stripped[idx:idx + len(anchor)]
+                    new_stripped = stripped[:idx] + f"[{original}]({url})" + stripped[idx + len(anchor):]
+                    lines[i] = line.replace(stripped, new_stripped)
+                    placed_urls.add(url.lower())
+                    fixed.append({"change": "llm_link_placement", "detail": f"Linked '{anchor}' to {url[:50]}"})
+                    break
+
+        result_article = "\n".join(lines)
+        added = len(fixed)
+        self.log(f"Sonnet placed {added} links from {len(placements)} suggestions")
+        return result_article, fixed
 
     def _dedup_existing_links(self, article: str) -> str:
         """Remove duplicate link URLs already in the article from the writer.
