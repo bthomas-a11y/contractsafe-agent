@@ -672,11 +672,11 @@ class FinalValidatorAgent(BaseAgent):
         else:
             checks.append(("Definition Extractability", True, "No definition sections detected"))
 
-        # ── 31. LLM Copy-Edit Review ──
-        gibberish_count = sum(1 for i in llm_issues if "[gibberish]" in i.lower() or "[broken]" in i.lower())
-        passed = gibberish_count == 0
-        checks.append(("Copy-Edit Review", passed,
-                       f"{len(llm_issues)} issues found ({gibberish_count} critical)" if llm_issues else "Clean"))
+        # ── 31. Opus Copy-Edit ──
+        edit_failed = any("failed" in i or "too-short" in i or "too-long" in i for i in llm_issues)
+        passed = not edit_failed
+        detail = llm_issues[0] if llm_issues else "No edit applied"
+        checks.append(("Opus Copy-Edit", passed, detail))
         if not passed:
             overall_pass = False
 
@@ -912,76 +912,70 @@ class FinalValidatorAgent(BaseAgent):
         return state
 
     def _llm_copy_edit(self, article: str, state: PipelineState) -> tuple[str, list[str]]:
-        """Haiku reads the article like a copy editor — catching what regex can't.
+        """Opus reads the full article as an editor and returns it with fixes applied.
 
-        Finds: gibberish, truncated sentences, garbled attributions, AI hallmark
-        phrases, keyword-stuffed titles, anything that sounds wrong.
-        Returns the article with fixes applied + list of issues found.
+        This is not a pattern-matching step. Opus reads the article as a human
+        would, fixes everything that sounds wrong, and returns the clean version.
+        The output IS the final article — no further processing.
         """
-        # Compact the article for Haiku — just the text, no tables
-        text_lines = []
-        for line in article.split("\n"):
-            stripped = line.strip()
-            if stripped and not stripped.startswith("|"):
-                text_lines.append(stripped)
-        compact = "\n".join(text_lines)
-
-        # If article is very long, truncate for Haiku
-        if len(compact) > 8000:
-            compact = compact[:8000] + "\n...[truncated]"
-
         system_prompt = (
-            "You are a copy editor doing a final review of a blog article. "
-            "Find problems that automated checks miss. Output ONLY a JSON object.\n\n"
-            "Look for:\n"
-            "1. GIBBERISH: garbled text, truncated sentences ending mid-word, "
-            "concatenated words, double attributions ('according to X, according to Y')\n"
-            "2. AI TELLS: phrases like 'Here's the thing', 'Let's dive in', "
-            "'navigate the complexities', 'a different animal', 'the whole game'\n"
-            "3. TITLE: Is the H1 just a keyword stuffed into a title? A good title "
-            "is specific and compelling, not just the SEO keyword repeated.\n"
-            "4. BROKEN: sentences that don't make sense, references to content "
-            "that was removed, orphaned fragments\n\n"
-            "Output JSON: {\"issues\": [{\"type\": \"gibberish|ai_tell|title|broken\", "
-            "\"line\": \"the problematic text\", \"fix\": \"suggested replacement or 'remove'\"}]}\n"
-            "If no issues found, output: {\"issues\": []}"
+            "You are a senior copy editor doing a final review of a blog article "
+            "before publication. Read every word. Fix everything that's wrong. "
+            "Return the complete, corrected article.\n\n"
+            "Fix:\n"
+            "- Gibberish, garbled text, truncated sentences\n"
+            "- Sentences missing subjects or verbs (from automated text removal)\n"
+            "- Orphaned fragments ('Staff turnover.' as a standalone line)\n"
+            "- Grammar errors ('a executed' → 'an executed')\n"
+            "- AI hallmark phrases ('Here's the thing', 'a different animal', "
+            "'navigate the complexities', 'the whole game', 'would make a CFO faint')\n"
+            "- Keyword-stuffed title (make it specific and compelling)\n"
+            "- Unnatural phrasing, awkward transitions, tautologies\n"
+            "- Lines that read like raw research data dumped into the article\n\n"
+            "Do NOT:\n"
+            "- Add new content, stats, or claims\n"
+            "- Change the article's structure (keep all H2s)\n"
+            "- Remove tables or formatting\n"
+            "- Change markdown link syntax [text](url)\n"
+            "- Add editorial comments — just fix the text\n\n"
+            "Return ONLY the complete corrected article in markdown. No commentary."
         )
 
-        user_prompt = f"ARTICLE:\n{compact}"
+        user_prompt = article
 
         original_model = self.model
         original_timeout = self.timeout
-        self.model = "haiku"
-        self.timeout = 90
+        self.model = "opus"
+        self.timeout = 180
         try:
-            result = self.call_llm_json(system_prompt, user_prompt)
+            edited = self.call_llm(system_prompt, user_prompt)
         except Exception as e:
-            self.log(f"[yellow]LLM copy-edit failed: {e}. Continuing without.[/yellow]")
-            self.model = original_model
-            self.timeout = original_timeout
-            return article, []
+            self.log(f"[yellow]Opus copy-edit failed: {e}. Using unedited article.[/yellow]")
+            return article, ["copy-edit-failed"]
         finally:
             self.model = original_model
             self.timeout = original_timeout
 
-        issues_found = []
-        if isinstance(result, dict) and "issues" in result:
-            for issue in result["issues"]:
-                issue_type = issue.get("type", "")
-                line_text = issue.get("line", "")
-                fix = issue.get("fix", "")
+        # Sanity check: edited article should be substantial and not radically different
+        if len(edited.split()) < len(article.split()) * 0.6:
+            self.log("[yellow]Opus returned a much shorter article. Keeping original.[/yellow]")
+            return article, ["copy-edit-too-short"]
 
-                issues_found.append(f"[{issue_type}] {line_text[:60]}")
-                # NEVER auto-apply Haiku's fixes — it returns editorial instructions
-                # ("Rewrite as..."), not replacement text. Only flag for reporting.
-                self.progress(f"  Flagged [{issue_type}]: {line_text[:60]}")
+        if len(edited.split()) > len(article.split()) * 1.4:
+            self.log("[yellow]Opus returned a much longer article. Keeping original.[/yellow]")
+            return article, ["copy-edit-too-long"]
 
-        if issues_found:
-            self.log(f"Copy-edit found {len(issues_found)} issues")
-        else:
-            self.log("Copy-edit: no issues found")
+        # Count what changed
+        import difflib
+        orig_lines = article.strip().split("\n")
+        edit_lines = edited.strip().split("\n")
+        diff = list(difflib.unified_diff(orig_lines, edit_lines, lineterm=""))
+        changes = sum(1 for d in diff if d.startswith("+") and not d.startswith("+++"))
 
-        return article, issues_found
+        issues_found = [f"Opus edited {changes} lines"]
+        self.log(f"Opus copy-edit: {changes} lines changed")
+
+        return edited, issues_found
 
     def _count_long_paragraphs(self, article: str) -> int:
         """Count prose paragraphs over 42 words. Skips tables, bullet/numbered lists."""

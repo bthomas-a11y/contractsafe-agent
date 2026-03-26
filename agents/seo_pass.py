@@ -38,12 +38,15 @@ class SEOPassAgent(BaseAgent):
         self.progress("Fixing keyword and heading issues...")
         article, fixed = self._apply_all_fixes(article, issues, state)
 
-        # ── Place links with Sonnet (comprehension, not pattern matching) ──
+        # ── Place links with Haiku (comprehension, not pattern matching) ──
         link_issues = [i for i in issues if "INTERNAL LINKS" in i or "EXTERNAL LINKS" in i]
         if link_issues:
-            self.progress("Placing links with Sonnet (reading article + link candidates)...")
-            article, link_fixed = self._place_links_with_llm(article, state)
-            fixed.extend(link_fixed)
+            self.progress("Placing links with Haiku...")
+            try:
+                article, link_fixed = self._place_links_with_llm(article, state)
+                fixed.extend(link_fixed)
+            except Exception as e:
+                self.log(f"[yellow]Link placement failed: {e}. Continuing without new links.[/yellow]")
 
         # ── Dedup again after link insertion (may have added duplicate URLs) ──
         article = self._dedup_existing_links(article)
