@@ -452,7 +452,7 @@ class KeywordClusterBuilder(BaseAgent):
             h2_str = ", ".join(c["h2s"][:8]) if c["h2s"] else "None"
             comp_text += f"  H2s: {h2_str}\n"
             comp_text += f"  Words: ~{c['word_count']}\n"
-            preview = c.get("content_preview", "")[:800]
+            preview = c.get("content_preview", "")[:500]
             if preview:
                 comp_text += f"  Content:\n    {preview}\n"
 
@@ -519,7 +519,10 @@ class KeywordClusterBuilder(BaseAgent):
             '  "strategic_notes": ["insight 1", "insight 2"]\n'
             "}\n\n"
             "Rules: 8-12 supporting keywords, 3-8 content gaps, "
-            "6-8 H2s, specific and actionable."
+            "6-8 H2s, specific and actionable.\n\n"
+            "IMPORTANT: Keep rationales to 1-2 sentences each. "
+            "The strategic_notes array should have 3-4 items max. "
+            "Be concise — this response must be under 6000 characters total."
         )
 
         return self.call_llm_json(system_prompt, user_prompt)

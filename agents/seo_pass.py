@@ -559,14 +559,17 @@ class SEOPassAgent(BaseAgent):
                     overlap = anchor_words & line_words
                     if len(overlap) >= min_overlap and stripped.endswith("."):
                         # Prefer a cluster phrase as anchor for diversity
+                        # (internal links only — external links to different
+                        # domains naturally share anchor text like "contract management")
                         effective_anchor = anchor
-                        low = stripped.lower()
-                        for cp in self._anchor_phrases:
-                            if self._is_anchor_repetitive(cp):
-                                continue
-                            if self._find_whole_word(cp, low) >= 0 and f"[{cp}" not in low:
-                                effective_anchor = cp
-                                break
+                        if link_type == "internal":
+                            low = stripped.lower()
+                            for cp in self._anchor_phrases:
+                                if self._is_anchor_repetitive(cp):
+                                    continue
+                                if self._find_whole_word(cp, low) >= 0 and f"[{cp}" not in low:
+                                    effective_anchor = cp
+                                    break
                         new_line = self._insert_link_naturally(stripped, effective_anchor, url)
                         if new_line is None:
                             continue  # would exceed 42 words

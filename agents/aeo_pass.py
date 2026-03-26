@@ -425,7 +425,7 @@ class AEOPassAgent(BaseAgent):
         lines = article.split("\n")
         modified = False
         stats_inserted = 0
-        max_insertions = 3  # Don't overwhelm the article
+        max_insertions = 4  # Enough to reach 3.0/1000 target after fact checker removals
 
         for stat_text, stat_source in unused_stats:
             if stats_inserted >= max_insertions:
