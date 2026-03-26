@@ -59,7 +59,7 @@ class BriefConsolidatorAgent(BaseAgent):
 
         # ── Key Facts & Statistics ──
         if state.key_facts:
-            sections.append("## Key Facts to Include")
+            sections.append("## Key Facts to Include (SOURCED — do not add unsourced facts)")
             for fact in state.key_facts:
                 if isinstance(fact, dict):
                     f_text = fact.get("fact", fact.get("text", str(fact)))
@@ -70,7 +70,7 @@ class BriefConsolidatorAgent(BaseAgent):
             sections.append("")
 
         if state.statistics:
-            sections.append("## Statistics to Reference")
+            sections.append("## Statistics to Reference (USE ONLY THESE — DO NOT INVENT OTHERS)")
             for stat in state.statistics:
                 if isinstance(stat, dict):
                     s_text = stat.get("stat", stat.get("text", str(stat)))
@@ -85,6 +85,37 @@ class BriefConsolidatorAgent(BaseAgent):
                 else:
                     sections.append(f"- {stat}")
             sections.append("")
+
+        # ── Keyword Cluster Strategy (from Agent 0) ──
+        cluster = state.keyword_cluster
+        if cluster and not cluster.get("synthesis_failed"):
+            sections.append("## Article Strategy (from Keyword Research)")
+            if cluster.get("article_angle"):
+                sections.append(f"**Article Angle:** {cluster['article_angle']}")
+            if cluster.get("vocabulary_note"):
+                sections.append(f"**Vocabulary:** {cluster['vocabulary_note']}")
+            if cluster.get("cannibalization_notes"):
+                sections.append(f"**Cannibalization Warning:** {cluster['cannibalization_notes']}")
+            sections.append("")
+
+            if cluster.get("content_gaps"):
+                sections.append("## Content Gaps to Cover")
+                sections.append("*These topics are NOT covered by any top-ranking competitor. "
+                              "Covering them differentiates this article:*")
+                for gap in cluster["content_gaps"]:
+                    sections.append(f"- **{gap.get('topic', '')}**: {gap.get('explanation', '')}")
+                sections.append("")
+
+            if cluster.get("strategic_notes"):
+                sections.append("## Strategic Notes")
+                for note in cluster["strategic_notes"]:
+                    sections.append(f"- {note}")
+                sections.append("")
+
+            if cluster.get("ai_overview_strategy"):
+                sections.append("## AI Overview Citability Strategy")
+                sections.append(cluster["ai_overview_strategy"])
+                sections.append("")
 
         # ── Target Audience ──
         sections.append("## Target Audience")

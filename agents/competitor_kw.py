@@ -22,6 +22,11 @@ class CompetitorKWAgent(BaseAgent):
     emoji = "\U0001f3f7\ufe0f"
 
     def run(self, state: PipelineState) -> PipelineState:
+        # If Agent 0 built a keyword cluster, use it instead of re-researching
+        cluster = state.keyword_cluster
+        if cluster and not cluster.get("synthesis_failed"):
+            return self._run_with_cluster(state, cluster)
+
         self.progress("Building keyword intelligence and analyzing competitors...")
         # --- Keyword Research (Google Autocomplete + KeywordsPeopleUse, free) ---
         self.progress(f"Running keyword research for: {state.target_keyword}")
@@ -129,6 +134,53 @@ class CompetitorKWAgent(BaseAgent):
             f"{len(state.keyword_data['questions_people_ask'])} questions"
             + (f", SEMrush vol={semrush_data.get('search_volume', 'N/A')}"
                if semrush_data.get("available") else "")
+        )
+        return state
+
+    def _run_with_cluster(self, state: PipelineState, cluster: dict) -> PipelineState:
+        """Simplified: keyword cluster already has research data. Populate state fields."""
+        raw = cluster.get("_raw", {})
+        self.progress("Using keyword cluster (skipping redundant keyword research)")
+
+        # Populate keyword_data from cluster raw data
+        state.keyword_data = {
+            "primary_kw": state.target_keyword,
+            "secondary_kws": state.secondary_keywords,
+            "questions_people_ask": raw.get("paa_questions", []),
+            "related_terms": raw.get("autocomplete", [])[:20],
+            "autocomplete_suggestions": raw.get("autocomplete", [])[:10],
+            "semantic_keywords": [],
+            "people_also_ask": raw.get("paa_questions", []),
+        }
+
+        # Populate competitor_pages from cluster's competitor analysis
+        topic_words = self._get_topic_words(state)
+        for comp in raw.get("competitor_analysis", []):
+            h2s = comp.get("h2s", [])
+            content_lower = " ".join(h2s).lower()
+            covered = {w for w in topic_words if w in content_lower}
+            missing = topic_words - covered
+
+            gaps = ""
+            if missing:
+                gaps = f"Missing topics: {', '.join(sorted(missing)[:5])}"
+
+            state.competitor_pages.append({
+                "url": comp.get("url", ""),
+                "title": comp.get("title", ""),
+                "h2s": h2s,
+                "word_count": comp.get("word_count", 0),
+                "gaps": gaps or "Well-covered",
+                "has_stats": False,
+                "has_lists": False,
+                "has_tables": False,
+                "has_faq": False,
+            })
+
+        self.log(
+            f"Populated from cluster: {len(state.competitor_pages)} competitors, "
+            f"{len(state.keyword_data['related_terms'])} related terms, "
+            f"{len(state.keyword_data['questions_people_ask'])} questions"
         )
         return state
 

@@ -197,10 +197,16 @@ NEVER: corporate language ("leverage," "streamline"), formal transitions ("Furth
 Style: No em dashes. Paragraphs under 42 words. Curly quotes only.
 Structure: metaphor declaration (one sentence), H1 title, short intro (<150 words), TL;DR (3-5 bullets), H2 sections with personality, closing CTA.
 
+CRITICAL — STATISTICS AND SOURCES:
+- Use ONLY statistics and source names that appear in the brief below. Do NOT invent, recall, or estimate statistics from your training data.
+- If a section would benefit from a statistic but the brief doesn't provide one, write the section with qualitative language. A missing stat is always better than a fabricated one.
+- When you use a stat from the brief, preserve the exact number and source name. Do not round, paraphrase, or attribute it to a different source.
+- NEVER fabricate a source name. If you're unsure whether a source is in the brief, leave it out.
+
 AEO (Answer Engine Optimization) — AI engines extract PASSAGES, not pages. The first 30% gets 44% of citations.
 1. ANSWER BLOCKS: Start every H2 with 1-2 sentences (20-50 words) that directly answer the heading's implied question. Then meander. No labels ("Quick Answer:"). Just lead with the point naturally.
-2. SPECIFIC NUMBERS: Every major claim needs a number. "Companies lose 9% of annual revenue" not "companies lose significant revenue." At least 3 data points per 1,000 words.
-3. NAME SOURCES IN TEXT: "according to Gartner" not just a link. Links get stripped during extraction.
+2. SPECIFIC NUMBERS: Use statistics from the brief to support claims. "Companies lose 9% of annual revenue" not "companies lose significant revenue." But NEVER invent a number. If the brief doesn't provide a stat, make the point with qualitative language.
+3. NAME SOURCES IN TEXT: "according to Gartner" not just a link. Links get stripped during extraction. But ONLY name sources that are in the brief. Do not invent source names.
 4. SELF-CONTAINED KEY PARAGRAPHS: Definitions, stats, and product claims must make sense extracted in isolation. No "This is why," "As mentioned above," or "They also" in key passages. Narrative paragraphs don't need this.
 5. SEMANTIC TRIPLES: One subject-predicate-object per core concept ("ContractSafe automates contract data extraction"). Give ContractSafe 2-3 triples: what it IS, DOES, and who it's FOR.
 6. ENTITY CONSISTENCY: One primary term per concept. Identify ContractSafe as "contract management software" in first 200 words.

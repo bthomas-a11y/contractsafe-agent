@@ -41,6 +41,26 @@ class FinalValidatorAgent(BaseAgent):
         self.progress("Applying final mechanical cleanup (dashes, paragraphs)...")
         article = apply_mechanical_fixes(article)
 
+        # Clean up orphaned fragments from fact checker or source stripping
+        # Lines starting with ". " — period fragment from partial sentence removal
+        article = re.sub(r'\n\. [A-Z][^\n]*\n', '\n\n', article)
+        # Orphaned decimal fragments: ".25 billion" where "$X" prefix was stripped
+        article = re.sub(r'\n\.\d+\s+(?:billion|million|trillion)[^\n]*\n', '\n\n', article)
+        article = re.sub(r'\n\.\d+\s+(?:percent|%)[^\n]*\n', '\n\n', article)
+        # Orphaned ". For" / ". That" / ". And" — continuation after removed stat
+        article = re.sub(r'\n\. (?:For|That|And|But|This|So|It) [^\n]*\n', '\n\n', article)
+
+        # Fix numbered list formatting: remove blank lines between step heading and body
+        # Pattern: "1. **Heading**\n\nBody text" → "1. **Heading**\nBody text"
+        article = re.sub(
+            r'(\d+\.\s+\*\*[^*]+\*\*\.?)\n\n([A-Z])',
+            r'\1\n\2',
+            article,
+        )
+
+        # Collapse any resulting triple+ blank lines
+        article = re.sub(r'\n{3,}', '\n\n', article)
+
         self.progress("Running 27-point quality checklist...")
 
         checks = []
@@ -582,6 +602,168 @@ class FinalValidatorAgent(BaseAgent):
                 overall_pass = False
         else:
             checks.append(("Definition Extractability", True, "No definition sections detected"))
+
+        # ── 31. Empty Numbered Steps ──
+        empty_steps = 0
+        article_lines = article.split('\n')
+        for li, aline in enumerate(article_lines):
+            step_match = re.match(r'^\d+\.\s+\*\*[^*]+\*\*\.?\s*$', aline.strip())
+            if step_match:
+                # Check if next non-blank line is another step or heading (no body)
+                for nli in range(li + 1, min(li + 3, len(article_lines))):
+                    next_line = article_lines[nli].strip()
+                    if not next_line:
+                        continue
+                    if re.match(r'^\d+\.\s+\*\*', next_line) or next_line.startswith('#'):
+                        empty_steps += 1
+                    break
+        passed = empty_steps == 0
+        checks.append(("No Empty Numbered Steps", passed,
+                       f"{empty_steps} steps with no body text" if empty_steps else ""))
+        if not passed:
+            overall_pass = False
+
+        # ── 32. Truncated Numbers ──
+        # Detect orphaned decimals like ".4 out of 10" (should be "9.4") or
+        # sentences that end abruptly before a number completes.
+        truncated_numbers = re.findall(
+            r'(?<!\d)\.(\d+)\s+(?:out of|percent|%|billion|million|per)', article
+        )
+        passed = len(truncated_numbers) == 0
+        checks.append(("No Truncated Numbers", passed,
+                       f"{len(truncated_numbers)} orphaned decimals found" if truncated_numbers else ""))
+        if not passed:
+            overall_pass = False
+
+        # ── 32. No Mechanical Keyword Insertions ──
+        # Detect patterns like "(including keyword phrase)" or
+        # ", a key aspect of keyword phrase." that Agent 10 injects
+        mechanical_kw = re.findall(
+            r'\(including [^)]{15,}\)', article
+        )
+        mechanical_kw += re.findall(
+            r', a key aspect of [^.]{15,}\.', article
+        )
+        passed = len(mechanical_kw) == 0
+        checks.append(("No Mechanical Keyword Insertions", passed,
+                       f"{len(mechanical_kw)} mechanical insertions found" if mechanical_kw else ""))
+        if not passed:
+            overall_pass = False
+
+        # ── 33. Secondary Keyword Coverage (hard fail if cluster exists) ──
+        cluster = state.keyword_cluster or {}
+        cluster_kws = [
+            kw["keyword"] for kw in cluster.get("supporting_keywords", [])
+            if kw.get("keyword")
+        ]
+        # Merge with state.secondary_keywords (may have been set from cluster)
+        all_secondary = list(dict.fromkeys(
+            [sk.lower() for sk in (state.secondary_keywords or [])]
+            + [sk.lower() for sk in cluster_kws]
+        ))
+        if all_secondary:
+            _sk_stopwords = {
+                "the", "a", "an", "of", "for", "and", "in", "to", "with",
+                "is", "on", "by", "at", "vs", "how", "what", "best",
+            }
+            sk_present = 0
+            for sk in all_secondary:
+                sk_words = sk.split()
+                if len(sk_words) <= 3:
+                    # Short keywords: exact-match
+                    if sk in article_lower:
+                        sk_present += 1
+                else:
+                    # Long keywords (4+ words): word-overlap — topic coverage is sufficient
+                    content_words = set(sk.split()) - _sk_stopwords
+                    if content_words:
+                        covered = sum(1 for w in content_words if w in article_lower)
+                        if covered >= len(content_words) * 0.6:
+                            sk_present += 1
+            sk_total = len(all_secondary)
+            sk_pct = sk_present / sk_total * 100 if sk_total else 100
+            passed = sk_pct >= 60
+            checks.append(("Secondary Keyword Coverage", passed,
+                           f"{sk_present}/{sk_total} keywords present ({sk_pct:.0f}%, threshold: 60%)"))
+            if not passed:
+                overall_pass = False
+        else:
+            checks.append(("Secondary Keyword Coverage", True, "No secondary keywords defined"))
+
+        # ── 32. Content Gap Coverage (hard fail if cluster has gaps) ──
+        content_gaps = cluster.get("content_gaps", [])
+        if content_gaps:
+            gaps_addressed = 0
+            for gap in content_gaps:
+                topic = gap.get("topic", "")
+                # Extract 2-3 key content words from the gap topic
+                gap_words = set(re.findall(r'[a-z]{4,}', topic.lower())) - {
+                    "what", "when", "where", "which", "does", "that", "this",
+                    "from", "with", "have", "been", "into", "about", "also",
+                    "their", "your", "most", "more", "than", "just", "only",
+                }
+                if len(gap_words) < 2:
+                    gaps_addressed += 1  # too vague to check
+                    continue
+                # Check if key gap words appear near each other in the article
+                covered = sum(1 for w in gap_words if w in article_lower)
+                if covered >= len(gap_words) * 0.5:
+                    gaps_addressed += 1
+            gap_total = len(content_gaps)
+            gap_pct = gaps_addressed / gap_total * 100 if gap_total else 100
+            passed = gap_pct >= 50
+            checks.append(("Content Gap Coverage", passed,
+                           f"{gaps_addressed}/{gap_total} gaps addressed ({gap_pct:.0f}%, threshold: 50%)"))
+            if not passed:
+                overall_pass = False
+        else:
+            checks.append(("Content Gap Coverage", True, "No content gaps defined"))
+
+        # ── 33. H2 Structure Alignment (soft — report only) ──
+        cluster_h2s = cluster.get("recommended_h2s", [])
+        if cluster_h2s and h2s:
+            h2_matched = 0
+            for rec_h2 in cluster_h2s:
+                rec_words = set(re.findall(r'[a-z]{3,}', rec_h2.lower())) - {
+                    "the", "and", "for", "how", "what", "why", "your",
+                    "that", "this", "with", "are",
+                }
+                for actual_h2 in h2s:
+                    actual_words = set(re.findall(r'[a-z]{3,}', actual_h2.lower())) - {
+                        "the", "and", "for", "how", "what", "why", "your",
+                        "that", "this", "with", "are",
+                    }
+                    if rec_words and actual_words:
+                        overlap = len(rec_words & actual_words) / max(len(rec_words), len(actual_words))
+                        if overlap > 0.4:
+                            h2_matched += 1
+                            break
+            checks.append(("H2 Structure Alignment", True,  # soft check
+                           f"{h2_matched}/{len(cluster_h2s)} recommended H2s reflected in article"))
+        else:
+            checks.append(("H2 Structure Alignment", True, "No cluster H2 recommendations"))
+
+        # ── 34. Keyword Cluster Integration Score (soft — report only) ──
+        if cluster_kws:
+            kc_present = 0
+            for ckw in cluster_kws:
+                ckw_words = ckw.lower().split()
+                if len(ckw_words) <= 3:
+                    if ckw.lower() in article_lower:
+                        kc_present += 1
+                else:
+                    # Long keywords: word-overlap (topic coverage, not exact match)
+                    content_words = set(ckw.lower().split()) - _sk_stopwords
+                    if content_words:
+                        covered = sum(1 for w in content_words if w in article_lower)
+                        if covered >= len(content_words) * 0.6:
+                            kc_present += 1
+            kc_total = len(cluster_kws)
+            kc_pct = kc_present / kc_total * 100 if kc_total else 100
+            checks.append(("Keyword Cluster Integration", True,  # soft check
+                           f"{kc_present}/{kc_total} cluster keywords present ({kc_pct:.0f}%)"))
+        else:
+            checks.append(("Keyword Cluster Integration", True, "No keyword cluster"))
 
         # ── Build report ──
         report_lines = ["# Final Validation Report\n"]

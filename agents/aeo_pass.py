@@ -617,11 +617,11 @@ class AEOPassAgent(BaseAgent):
         faq_entries = []
         for q in unaddressed[:3]:  # Max 3 to avoid bloat
             q_clean = q.strip().rstrip("?") + "?"
-            # Capitalize first letter of question
             q_clean = q_clean[0].upper() + q_clean[1:] if q_clean else q_clean
-            faq_entries.append(f"### {q_clean}\n")
-            # Find a relevant sentence from the article to use as the answer
             answer = self._extract_faq_answer(article, q, kw)
+            if not answer:
+                continue  # No relevant sentence found — skip rather than insert generic template
+            faq_entries.append(f"### {q_clean}\n")
             faq_entries.append(f"{answer}\n")
 
         if not faq_entries:
@@ -847,11 +847,10 @@ class AEOPassAgent(BaseAgent):
         if any(re.search(p, article, re.IGNORECASE) for p in unique_signals):
             return None
 
-        kw = state.target_keyword or "contract management"
         insert_sentence = (
-            f"According to the ContractSafe Industry Report, "
-            f"70% of in-house lawyers say tech inefficiencies keep them from doing "
-            f"their best work, underscoring the need for streamlined {kw} solutions."
+            "According to the ContractSafe Industry Report, "
+            "70% of in-house lawyers say tech inefficiencies keep them from doing "
+            "their best work, highlighting the operational cost of outdated contract workflows."
         )
 
         lines = article.split('\n')
@@ -966,8 +965,9 @@ class AEOPassAgent(BaseAgent):
                 answer += "."
             return answer
 
-        # Fallback: construct a basic answer from the keyword
-        return f"Yes, {kw} involves structured processes for handling contract modifications, including amendments, renewals, and scope changes. The approach depends on your organization's specific workflows and compliance requirements."
+        # No relevant sentence found — return empty to signal the caller
+        # should skip this FAQ entry rather than insert a generic template
+        return ""
 
     # ── Programmatic AEO audit ──
 

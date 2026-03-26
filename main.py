@@ -31,6 +31,7 @@ from config import (
     CLAUDE_CLI, PIPELINE_BUDGET_SECONDS, EDITING_BUDGET_SECONDS, AGENT_EXPECTED_TIMES,
 )
 from agents import AGENT_PIPELINE
+from agents.keyword_cluster_builder import KeywordClusterBuilder
 from agents.brief_consolidator import BriefConsolidatorAgent
 from agents.content_writer import ContentWriterAgent
 from tools.docx_export import markdown_to_docx
@@ -312,16 +313,17 @@ class PipelineTracker:
 
         # ── Overall pipeline progress bar ──
         overall_w = 30
-        overall_filled = int(overall_w * done_count / 13)
-        pct = int(100 * done_count / 13)
+        total_agents = len(AGENT_INFO)
+        overall_filled = int(overall_w * done_count / total_agents)
+        pct = int(100 * done_count / total_agents)
 
         footer = Text()
         footer.append("\n ")
         footer.append("\u2501" * 72, style="dim")
         footer.append("\n  Pipeline  ", style="bold")
-        footer.append("\u2588" * overall_filled, style="green" if done_count == 13 else "cyan bold")
+        footer.append("\u2588" * overall_filled, style="green" if done_count == total_agents else "cyan bold")
         footer.append("\u2591" * (overall_w - overall_filled), style="dim")
-        footer.append(f"  {done_count}/13 ({pct}%)", style="bold")
+        footer.append(f"  {done_count}/{total_agents} ({pct}%)", style="bold")
         footer.append(f"  \u2502  {total_elapsed:.0f}s elapsed", style="dim")
 
         if running:
@@ -1054,6 +1056,15 @@ def _save_reports(state: PipelineState, output_dir: Path):
     reports_dir.mkdir(parents=True, exist_ok=True)
     from datetime import datetime
 
+    # ── 00: Keyword Cluster Report ──
+    if state.keyword_cluster and not state.keyword_cluster.get("synthesis_failed"):
+        try:
+            from agents.keyword_cluster_builder import KeywordClusterBuilder
+            cluster_report = KeywordClusterBuilder().build_report(state)
+            (reports_dir / "00_keyword_cluster.txt").write_text(cluster_report)
+        except Exception:
+            pass
+
     # ── 01: Research Summary ──
     lines = [
         "RESEARCH SUMMARY",
@@ -1384,6 +1395,38 @@ def save_outputs(state: PipelineState) -> Path:
     except Exception as e:
         console.print(f"  [yellow]Report generation failed: {e}[/yellow]")
 
+    # Append used stats to the cited-stats ledger (prevents reuse across articles)
+    try:
+        import re as _re
+        from datetime import date as _date
+        ledger_path = Path("knowledge/cited_stats.md")
+        if ledger_path.exists() and state.pass_fail:
+            article_text = state.final_article or ""
+            slug = state.get_topic_slug()
+            today = _date.today().strftime("%Y-%m-%d")
+            # Find stat lines in the article (lines with numbers + attributions)
+            stat_entries = []
+            for line in article_text.split("\n"):
+                line_s = line.strip()
+                if not line_s or line_s.startswith("#") or line_s.startswith("|"):
+                    continue
+                if _re.search(r'\d+%|\$[\d,]+|\d+\s*(?:billion|million)', line_s):
+                    if any(p in line_s.lower() for p in ["according to", "report", "survey", "found that"]):
+                        stat_text = line_s[:80].replace("|", "/")
+                        source = ""
+                        src_match = _re.search(r'(?:according to|per) ([A-Z][^,.\n]{5,40})', line_s)
+                        if src_match:
+                            source = src_match.group(1).strip()
+                        stat_entries.append(f"{stat_text} | {source} | {slug} | {today}")
+
+            if stat_entries:
+                with open(ledger_path, "a") as f:
+                    for entry in stat_entries:
+                        f.write(f"\n{entry}")
+                console.print(f"  [dim]Logged {len(stat_entries)} stats to cited_stats.md[/dim]")
+    except Exception:
+        pass
+
     return output_dir
 
 
@@ -1421,6 +1464,46 @@ def run_pipeline(cli_args: argparse.Namespace):
     ))
     console.print()
 
+    # ═══════════════════════════════════════════════════════════
+    # PRE-PIPELINE: Keyword Cluster Research (Agent 0)
+    # Runs before the pipeline budget timer starts.
+    # ═══════════════════════════════════════════════════════════
+    if 0 not in state.completed_agents:
+        console.print(Panel(
+            "\U0001f52c Keyword Cluster Research",
+            box=box.HEAVY, border_style="cyan", padding=(0, 2),
+        ))
+        cluster_agent = KeywordClusterBuilder()
+        cluster_start = time.time()
+        try:
+            state = cluster_agent.run(state)
+            cluster_elapsed = time.time() - cluster_start
+            state.completed_agents.append(0)
+            save_state(state)
+
+            cluster = state.keyword_cluster
+            if cluster and not cluster.get("synthesis_failed"):
+                console.print(
+                    f"  [green]Keyword cluster built in {cluster_elapsed:.0f}s: "
+                    f"target='{cluster.get('target_keyword')}', "
+                    f"{len(cluster.get('supporting_keywords', []))} supporting keywords, "
+                    f"{len(cluster.get('content_gaps', []))} content gaps[/green]"
+                )
+            else:
+                console.print(f"  [yellow]Keyword cluster incomplete ({cluster_elapsed:.0f}s). Pipeline continues with standard research.[/yellow]")
+        except Exception as e:
+            cluster_elapsed = time.time() - cluster_start
+            console.print(f"  [yellow]Keyword cluster failed ({cluster_elapsed:.0f}s): {e}. Pipeline continues without cluster.[/yellow]")
+            state.completed_agents.append(0)
+            save_state(state)
+
+        # Show updated config if keyword changed
+        if state.target_keyword != (cli_args.keyword or ""):
+            console.print(f"  [cyan]Keyword updated to: {state.target_keyword}[/cyan]")
+        if state.secondary_keywords:
+            console.print(f"  [dim]Secondary keywords: {', '.join(state.secondary_keywords[:5])}{'...' if len(state.secondary_keywords) > 5 else ''}[/dim]")
+        console.print()
+
     # Initialize tracker
     _tracker = PipelineTracker()
     _tracker.start()
@@ -1430,8 +1513,10 @@ def run_pipeline(cli_args: argparse.Namespace):
     agent_timings = {}
 
     # Mark already-completed agents as done (not skipped) in tracker
+    # Skip Agent 0 (keyword cluster) — it runs before the tracker and isn't in AGENT_INFO
     for i in state.completed_agents:
-        _tracker.mark_done(i)
+        if i in _tracker.agent_status:
+            _tracker.mark_done(i)
 
     def _start_live():
         """Start (or restart) the Live display."""

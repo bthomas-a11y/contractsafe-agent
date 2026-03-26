@@ -42,7 +42,11 @@ class LinkResearcherAgent(BaseAgent):
         internal_candidates = self._find_internal_candidates(state)
 
         # ── Phase 2: Gather external link candidates ──
-        external_candidates = self._find_external_candidates(state)
+        # Start with research source URLs — these are pages Agent 2 actually read
+        # and extracted facts/stats from. A blog writer links to their sources.
+        external_candidates = self._research_source_links(state)
+        # Then supplement with search-discovered links
+        external_candidates += self._find_external_candidates(state)
 
         # ── Phase 3: Verify every URL is live AND check relevance programmatically ──
         self.progress("Verifying links are live and topic-relevant...")
@@ -121,6 +125,51 @@ class LinkResearcherAgent(BaseAgent):
 
         return state
 
+    def _research_source_links(self, state: PipelineState) -> list[dict]:
+        """Build external link candidates from pages Agent 2 actually read.
+
+        A blog writer's external links come from their research. If they found
+        a stat from worldcc.com, they link to that worldcc.com page. The link
+        IS the citation — it proves the stat is real.
+        """
+        candidates = []
+        seen_urls = set()
+
+        # Stats have source URLs — these are the highest-value external links
+        for stat in state.statistics:
+            url = stat.get("source_url", "")
+            if not url or url in seen_urls or is_internal(url) or is_blocked(url):
+                continue
+            seen_urls.add(url)
+            source_name = stat.get("source_name", "")
+            stat_text = stat.get("stat", "")
+            candidates.append({
+                "url": url,
+                "title": source_name,
+                "anchor_suggestion": source_name[:40] if source_name else "research source",
+                "relevance_summary": f"Source of stat: {stat_text[:80]}",
+                "from_research": True,
+            })
+
+        # Key facts also have source URLs
+        for fact in state.key_facts:
+            url = fact.get("source", fact.get("source_url", ""))
+            if not url or url in seen_urls or is_internal(url) or is_blocked(url):
+                continue
+            seen_urls.add(url)
+            candidates.append({
+                "url": url,
+                "title": fact.get("fact", "")[:50],
+                "anchor_suggestion": "research source",
+                "relevance_summary": f"Source of fact: {fact.get('fact', '')[:80]}",
+                "from_research": True,
+            })
+
+        if candidates:
+            self.progress(f"Found {len(candidates)} external link candidates from research sources")
+
+        return candidates
+
     # ── Topic word extraction for relevance matching ──
 
     def _get_topic_words(self, state: PipelineState) -> set[str]:
@@ -160,13 +209,40 @@ class LinkResearcherAgent(BaseAgent):
         return words
 
     def _check_relevance_programmatic(self, page_content: str, topic_words: set[str]) -> tuple[bool, str]:
-        """Check relevance using keyword matching. Returns (is_relevant, reason)."""
+        """Check relevance by verifying the page's PRIMARY topic matches ours.
+
+        A blog writer would click the link and ask: "Is this page actually about
+        the same topic as my article?" A CRM page that mentions 'contract' in
+        passing is NOT relevant to a contract management article.
+
+        Checks:
+        1. The page's H1/title must contain at least 2 topic words (primary topic match)
+        2. The overall content must match 4+ topic words (general relevance)
+        Both must pass.
+        """
         content_lower = page_content.lower()
-        matches = [w for w in topic_words if w in content_lower]
-        # Require 4+ matches for stronger relevance signal
-        if len(matches) >= 4:
-            return True, f"Matched {len(matches)} topic words: {', '.join(matches[:5])}"
-        return False, f"Only matched {len(matches)} topic words (need 4+)"
+
+        # Extract H1 and first heading
+        h1_match = re.search(r'^#\s+(.+)$', page_content, re.MULTILINE)
+        title_text = h1_match.group(1).lower() if h1_match else ""
+        if not title_text:
+            # Try first non-empty line as title
+            for line in page_content.split('\n'):
+                stripped = line.strip()
+                if stripped and not stripped.startswith('|') and len(stripped) > 10:
+                    title_text = stripped.lower()
+                    break
+
+        # Check 1: Page title/H1 must match at least 2 topic words
+        title_matches = [w for w in topic_words if w in title_text]
+        if len(title_matches) < 2:
+            return False, f"Page title doesn't match topic (only {len(title_matches)} words in title: '{title_text[:60]}')"
+
+        # Check 2: Overall content must match 4+ topic words
+        content_matches = [w for w in topic_words if w in content_lower]
+        if len(content_matches) >= 4:
+            return True, f"Title matched {len(title_matches)} words, content matched {len(content_matches)} words"
+        return False, f"Only matched {len(content_matches)} topic words in content (need 4+)"
 
     def _generate_anchor(self, title: str) -> str:
         """Generate a 2-4 word keyword anchor from a page title.

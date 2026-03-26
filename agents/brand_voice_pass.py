@@ -749,6 +749,7 @@ def _strip_source_artifacts(article: str) -> str:
         # Remove entire lines starting with "According to [page title]"
         # Page titles contain ?, :, &, or are truncated (>50 chars)
         at_match = re.match(r'^According to ([^,\n]+)', stripped)
+        at_is_legitimate = False
         if at_match:
             src_name = at_match.group(1).strip().rstrip('.')
             # Check if last word looks truncated (no vowels, or single letter)
@@ -770,24 +771,27 @@ def _strip_source_artifacts(article: str) -> str:
             )
             if is_garbled:
                 continue  # Skip the entire line
+            else:
+                at_is_legitimate = True  # Real source — don't strip this line
 
         # Strip parenthetical attributions: "(according to ...)"
         line = re.sub(r'\s*\([Aa]ccording to [^)]+\)', '', line)
 
         # Strip ", according to [Truncated Source Title]" at end of sentences
-        # Case-insensitive. Match: comma + "according to" + long non-link text
-        # (35+ chars = likely a truncated article title, not "Deloitte")
-        line = re.sub(
-            r',?\s*[Aa]ccording to [A-Z0-9][^[\n]{35,}?(?:\.|$)',
-            lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
-            line
-        )
-        # Also strip article titles used as sources (contain ? or start with number)
-        line = re.sub(
-            r',?\s*[Aa]ccording to [A-Z0-9][^[\n]*?\?[.\s]',
-            lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
-            line
-        )
+        # Only applies to MID-SENTENCE "according to" — skip if the line starts
+        # with a legitimate "According to [Source]" that passed the check above.
+        if not at_is_legitimate:
+            line = re.sub(
+                r',?\s*[Aa]ccording to [A-Z0-9][^[\n]{35,}?\.(?!\d)(?=\s|$)',
+                lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
+                line
+            )
+            # Also strip article titles used as sources (contain ?)
+            line = re.sub(
+                r',?\s*[Aa]ccording to [A-Z0-9][^[\n]*?\?[.\s]',
+                lambda m: '.' if m.group(0).rstrip().endswith('.') else '',
+                line
+            )
         cleaned.append(line)
     return "\n".join(cleaned)
 

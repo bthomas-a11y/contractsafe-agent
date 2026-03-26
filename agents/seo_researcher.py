@@ -25,6 +25,11 @@ class SEOResearcherAgent(BaseAgent):
     emoji = "\U0001f4ca"
 
     def run(self, state: PipelineState) -> PipelineState:
+        # If Agent 0 built a keyword cluster, use it (skip redundant SERP/autocomplete)
+        cluster = state.keyword_cluster
+        if cluster and not cluster.get("synthesis_failed"):
+            return self._run_with_cluster(state, cluster)
+
         self.progress("Analyzing search results and building content structure...")
 
         # --- SERP analysis ---
@@ -171,6 +176,108 @@ class SEOResearcherAgent(BaseAgent):
 
         self.log(f"Recommended {len(state.recommended_h2s)} H2 headings")
         return state
+
+    def _run_with_cluster(self, state: PipelineState, cluster: dict) -> PipelineState:
+        """Simplified: use cluster's H2s and data, just run citability analysis."""
+        raw = cluster.get("_raw", {})
+        self.progress("Using keyword cluster (skipping redundant SERP/keyword research)")
+
+        # Use cluster's recommended H2s directly
+        state.recommended_h2s = cluster.get("recommended_h2s", [])
+        self.progress(f"H2s from cluster: {len(state.recommended_h2s)}")
+
+        # Detect SERP features from cluster's raw SERP data
+        serp_queries = raw.get("serp_queries", [])
+        features = []
+        for query in serp_queries:
+            features.append(f"SERP analyzed: {query}")
+        cs_positions = raw.get("cs_positions", {})
+        for query, pos in cs_positions.items():
+            features.append(f"ContractSafe #{pos} for: {query}")
+        state.serp_features = features
+
+        # Run citability analysis (this is unique to Agent 4, not in Agent 0)
+        if DATAFORSEO_LOGIN:
+            from tools.dataforseo import query_fanout_citability
+            paa = raw.get("paa_questions", [])[:4]
+            related = raw.get("related_searches", [])[:4]
+            if paa or related:
+                self.progress("Running AI Overview citability analysis...")
+                citability = query_fanout_citability(
+                    target_keyword=state.target_keyword,
+                    paa_questions=paa,
+                    related_searches=related,
+                )
+                state.citability_analysis = citability
+                aio_count = citability.get("queries_with_ai_overview", 0)
+                self.progress(f"Citability: {aio_count}/{citability.get('queries_analyzed', 0)} queries have AI Overviews")
+
+        # Build SEO brief from cluster data
+        state.seo_brief = self._build_cluster_seo_brief(state, cluster)
+        self.log(f"SEO brief built from cluster ({len(state.seo_brief)} chars)")
+        return state
+
+    def _build_cluster_seo_brief(self, state: PipelineState, cluster: dict) -> str:
+        """Build SEO brief from keyword cluster data."""
+        raw = cluster.get("_raw", {})
+        sections = [f"# SEO Analysis: {state.target_keyword}\n"]
+
+        sections.append("## Target Keyword Strategy")
+        sections.append(f"**Target:** {cluster.get('target_keyword', state.target_keyword)}")
+        sections.append(f"**Rationale:** {cluster.get('target_keyword_rationale', 'N/A')}")
+        if cluster.get("vocabulary_note"):
+            sections.append(f"**Vocabulary:** {cluster['vocabulary_note']}")
+        if cluster.get("cannibalization_notes"):
+            sections.append(f"**Cannibalization:** {cluster['cannibalization_notes']}")
+        sections.append("")
+
+        sections.append("## Article Angle")
+        sections.append(cluster.get("article_angle", "No angle specified."))
+        sections.append("")
+
+        if cluster.get("content_gaps"):
+            sections.append("## Content Gaps to Exploit")
+            for gap in cluster["content_gaps"]:
+                sections.append(f"- **{gap.get('topic', '')}**: {gap.get('explanation', '')}")
+            sections.append("")
+
+        if cluster.get("supporting_keywords"):
+            sections.append("## Supporting Keywords")
+            for kw in cluster["supporting_keywords"]:
+                sections.append(f"- {kw.get('keyword', '')}: [{kw.get('intent', '')}] {kw.get('role', '')}")
+            sections.append("")
+
+        if cluster.get("recommended_h2s"):
+            sections.append("## Recommended H2 Structure")
+            for h2 in cluster["recommended_h2s"]:
+                sections.append(f"- {h2}")
+            if cluster.get("h2_rationale"):
+                sections.append(f"\n**Rationale:** {cluster['h2_rationale']}")
+            sections.append("")
+
+        if cluster.get("ai_overview_strategy"):
+            sections.append("## AI Overview Strategy")
+            sections.append(cluster["ai_overview_strategy"])
+            sections.append("")
+
+        cs_positions = raw.get("cs_positions", {})
+        if cs_positions:
+            sections.append("## ContractSafe SERP Positions")
+            for query, pos in cs_positions.items():
+                sections.append(f"- #{pos} for \"{query}\"")
+            sections.append("")
+
+        if state.competitor_pages:
+            sections.append("## Competitor Analysis")
+            for cp in state.competitor_pages:
+                h2s = ", ".join(cp.get("h2s", [])) if cp.get("h2s") else "N/A"
+                sections.append(f"- {cp.get('title', 'Unknown')} ({cp.get('url', '')})")
+                sections.append(f"  Word count: ~{cp.get('word_count', 'unknown')}")
+                sections.append(f"  H2s: {h2s}")
+                sections.append(f"  Gaps: {cp.get('gaps', 'N/A')}")
+            sections.append("")
+
+        return "\n".join(sections)
 
     def _build_recommended_h2s(self, state: PipelineState, all_questions: list[str]) -> list[str]:
         """Build recommended H2s programmatically from competitor data + PAA + keywords."""

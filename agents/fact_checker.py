@@ -258,6 +258,10 @@ class FactCheckerAgent(BaseAgent):
                     and self._ORPHAN_PATTERN.match(neighbor)
                     and not re.search(r'\d+%|\$[\d,]+', neighbor)):
                 lines[j] = ""
+            # Lines starting with ". " or just "." — period fragment from
+            # removing a sentence that was part of a larger paragraph
+            elif neighbor.startswith(". ") or neighbor == ".":
+                lines[j] = ""
 
     def _remove_unverified_claim(self, article: str, claim: str) -> tuple[str, bool]:
         """Remove an unverified claim from the article. Returns (revised_article, was_removed).

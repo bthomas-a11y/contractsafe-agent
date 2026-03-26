@@ -21,6 +21,9 @@ class PipelineState:
     uploaded_article_text: Optional[str] = None
     additional_instructions: str = ""
 
+    # --- Agent 0: Keyword Cluster ---
+    keyword_cluster: dict = field(default_factory=dict)
+
     # --- Agent 1: Product Knowledge ---
     product_knowledge: str = ""
 

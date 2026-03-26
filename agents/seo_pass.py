@@ -140,6 +140,11 @@ class SEOPassAgent(BaseAgent):
 
     def _fix_keyword_in_h2(self, article: str, keyword: str) -> str | None:
         """Insert keyword into the most relevant H2 heading."""
+        # Long keywords (4+ words) can't be naturally inserted into H2s.
+        # They'll appear in H1, intro, and body text — that's sufficient.
+        if len(keyword.split()) > 3:
+            return None
+
         h2s = re.findall(r"^(## .+)$", article, re.MULTILINE)
         if not h2s:
             return None
@@ -167,11 +172,7 @@ class SEOPassAgent(BaseAgent):
 
         h2_text = best_h2[3:].strip()
         kw_title = keyword.title() if keyword == keyword.lower() else keyword
-
-        if len(keyword.split()) <= 3:
-            new_h2 = f"## {kw_title}: {h2_text}"
-        else:
-            new_h2 = f"## {h2_text} ({kw_title})"
+        new_h2 = f"## {kw_title}: {h2_text}"
 
         return article.replace(best_h2, new_h2, 1)
 
@@ -181,7 +182,13 @@ class SEOPassAgent(BaseAgent):
         current_count = article.lower().count(kw_lower)
         kw_word_count = len(keyword.split())
 
-        target = 2 if kw_word_count >= 4 else max(3, len(article.split()) // 500)
+        # Long keywords (4+ words) are too awkward to inject into body paragraphs
+        # with templates like ", a key aspect of {keyword}." — they produce
+        # ungrammatical output. H1 + intro fixes handle minimum placement.
+        if kw_word_count >= 4:
+            return None
+
+        target = max(3, len(article.split()) // 500)
         if current_count >= target:
             return None
 
@@ -323,6 +330,25 @@ class SEOPassAgent(BaseAgent):
 
         return "\n".join(lines) if modified else None
 
+    @staticmethod
+    def _find_whole_word(phrase: str, text: str) -> int:
+        """Find phrase in text at word boundaries. Returns index or -1."""
+        start = 0
+        while True:
+            idx = text.find(phrase, start)
+            if idx == -1:
+                return -1
+            # Check word boundary before
+            if idx > 0 and text[idx - 1].isalpha():
+                start = idx + 1
+                continue
+            # Check word boundary after
+            end = idx + len(phrase)
+            if end < len(text) and text[end].isalpha():
+                start = idx + 1
+                continue
+            return idx
+
     def _dedup_existing_links(self, article: str) -> str:
         """Remove duplicate link URLs already in the article from the writer.
 
@@ -376,34 +402,12 @@ class SEOPassAgent(BaseAgent):
         return None
 
     def _fix_secondary_keywords(self, article: str, secondary_kws: list[str]) -> str | None:
-        """Add missing secondary keywords to relevant paragraphs."""
-        if not secondary_kws:
-            return None
-
-        lines = article.split("\n")
-        modified = False
-
-        for sk in secondary_kws:
-            if sk.lower() in article.lower():
-                continue
-
-            # Find a relevant paragraph to insert into
-            sk_words = set(sk.lower().split())
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                if (not stripped or stripped.startswith("#") or stripped.startswith("|")
-                        or len(stripped) < 40 or sk.lower() in stripped.lower()
-                        or ("[" in stripped and "](" in stripped)):
-                    continue
-
-                line_words = set(stripped.lower().split())
-                if sk_words & line_words and stripped.endswith("."):
-                    new_line = stripped[:-1] + f" (including {sk})."
-                    lines[i] = line.replace(stripped, new_line)
-                    modified = True
-                    break
-
-        return "\n".join(lines) if modified else None
+        """Secondary keywords are strategic guidance from the keyword cluster,
+        not phrases to mechanically inject. The writer received them in the brief.
+        If the article doesn't contain them as exact phrases, that's acceptable
+        as long as the topics are covered (validated by Agent 13 with word-overlap).
+        Mechanical injection (e.g., '(including X)') always produces bad output."""
+        return None
 
     def _fix_add_links(self, article: str, available_links: list[dict], link_type: str) -> str | None:
         """Add links from the available pool to topically relevant sentences."""
@@ -515,8 +519,8 @@ class SEOPassAgent(BaseAgent):
                             continue
                         low = stripped.lower()
                         for phrase in all_internal_phrases:
-                            if phrase in low and f"[{phrase}" not in low:
-                                idx = low.index(phrase)
+                            idx = self._find_whole_word(phrase, low)
+                            if idx >= 0 and f"[{phrase}" not in low:
                                 before = stripped[:idx]
                                 if before.count('[') > before.count(']'):
                                     continue
@@ -576,8 +580,8 @@ class SEOPassAgent(BaseAgent):
                         ]
                         placed = False
                         for phrase in all_phrases:
-                            if phrase in low and f"[{phrase}" not in low:
-                                idx = low.index(phrase)
+                            idx = self._find_whole_word(phrase, low)
+                            if idx >= 0 and f"[{phrase}" not in low:
                                 # Don't wrap if already inside a link
                                 before = stripped[:idx]
                                 if before.count('[') > before.count(']'):
@@ -893,15 +897,16 @@ class SEOPassAgent(BaseAgent):
         report_lines.append(f"Keyword in first 100 words: {'PASS' if kw in first_100 else 'FAIL'}")
 
         # ── 3. Keyword in at least one H2 ──
+        kw_word_count = len(kw.split())
         h2s = re.findall(r"^## (.+)$", article, re.MULTILINE)
         h2_has_kw = any(kw in h.lower() for h in h2s)
-        if not h2_has_kw and h2s:
+        # Long keywords (4+ words) can't be naturally inserted into H2s — skip the check
+        if not h2_has_kw and h2s and kw_word_count <= 3:
             issues.append(f"KEYWORD NOT IN ANY H2. Reword one H2 to include '{state.target_keyword}' or a close variant.")
         report_lines.append(f"Keyword in H2: {'PASS' if h2_has_kw else 'FAIL'} (H2s: {h2s})")
 
         # ── 4. Keyword density (scaled by keyword length) ──
         kw_count = text_lower.count(kw)
-        kw_word_count = len(kw.split())
         if kw_word_count >= 4:
             ideal_min = 2
             ideal_max = max(4, word_count // 500)
