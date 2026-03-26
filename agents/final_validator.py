@@ -912,33 +912,31 @@ class FinalValidatorAgent(BaseAgent):
         return state
 
     def _llm_copy_edit(self, article: str, state: PipelineState) -> tuple[str, list[str]]:
-        """Opus reads the full article as an editor and returns it with fixes applied.
+        """Opus reads the full article and returns FIND/REPLACE fixes.
 
-        This is not a pattern-matching step. Opus reads the article as a human
-        would, fixes everything that sounds wrong, and returns the clean version.
-        The output IS the final article — no further processing.
+        Opus reads every word like a human editor. Returns only the CHANGES
+        as FIND/REPLACE pairs — not the full article. This keeps output small
+        (~2K chars) so the call completes in ~80-100s instead of timing out.
         """
         system_prompt = (
-            "You are a senior copy editor doing a final review of a blog article "
-            "before publication. Read every word. Fix everything that's wrong. "
-            "Return the complete, corrected article.\n\n"
+            "You are a senior copy editor. Read this article and fix every problem. "
+            "Return ONLY FIND/REPLACE pairs for each fix. Do not return the full article.\n\n"
             "Fix:\n"
-            "- Gibberish, garbled text, truncated sentences\n"
-            "- Sentences missing subjects or verbs (from automated text removal)\n"
-            "- Orphaned fragments ('Staff turnover.' as a standalone line)\n"
-            "- Grammar errors ('a executed' → 'an executed')\n"
-            "- AI hallmark phrases ('Here's the thing', 'a different animal', "
-            "'navigate the complexities', 'the whole game', 'would make a CFO faint')\n"
-            "- Keyword-stuffed title (make it specific and compelling)\n"
-            "- Unnatural phrasing, awkward transitions, tautologies\n"
-            "- Lines that read like raw research data dumped into the article\n\n"
-            "Do NOT:\n"
-            "- Add new content, stats, or claims\n"
-            "- Change the article's structure (keep all H2s)\n"
-            "- Remove tables or formatting\n"
-            "- Change markdown link syntax [text](url)\n"
-            "- Add editorial comments — just fix the text\n\n"
-            "Return ONLY the complete corrected article in markdown. No commentary."
+            "- Gibberish, garbled text, truncated sentences (FIND the bad line, REPLACE with 'remove' to delete it)\n"
+            "- Sentences missing subjects or verbs\n"
+            "- Orphaned fragments (e.g., 'Staff turnover.' as a standalone line)\n"
+            "- Grammar errors ('a executed' -> 'an executed')\n"
+            "- AI hallmark phrases: remove or rewrite 'Here\\'s the thing', 'a different animal', "
+            "'would make a CFO faint', 'the whole game', 'Let\\'s dive in', 'navigate the complexities'\n"
+            "- Keyword-stuffed H1 title: rewrite to be specific and compelling\n"
+            "- Lines that read like raw research data dumped into the article\n"
+            "- Tautologies ('Mismanagement can lead to financial losses' after saying the same thing)\n\n"
+            "Do NOT change: article structure, H2 headings, tables, markdown links, or add new content.\n\n"
+            "Format each fix as:\n"
+            "FIND: \"exact text from article\"\n"
+            "REPLACE: \"corrected text\"\n\n"
+            "Use REPLACE: \"\" (empty) to delete a line entirely.\n"
+            "If the article is clean, output: NO CHANGES NEEDED"
         )
 
         user_prompt = article
@@ -948,7 +946,7 @@ class FinalValidatorAgent(BaseAgent):
         self.model = "opus"
         self.timeout = 180
         try:
-            edited = self.call_llm(system_prompt, user_prompt)
+            response = self.call_llm(system_prompt, user_prompt)
         except Exception as e:
             self.log(f"[yellow]Opus copy-edit failed: {e}. Using unedited article.[/yellow]")
             return article, ["copy-edit-failed"]
@@ -956,26 +954,23 @@ class FinalValidatorAgent(BaseAgent):
             self.model = original_model
             self.timeout = original_timeout
 
-        # Sanity check: edited article should be substantial and not radically different
-        if len(edited.split()) < len(article.split()) * 0.6:
-            self.log("[yellow]Opus returned a much shorter article. Keeping original.[/yellow]")
-            return article, ["copy-edit-too-short"]
+        if "NO CHANGES NEEDED" in response:
+            self.log("Opus copy-edit: article is clean")
+            return article, ["clean"]
 
-        if len(edited.split()) > len(article.split()) * 1.4:
-            self.log("[yellow]Opus returned a much longer article. Keeping original.[/yellow]")
-            return article, ["copy-edit-too-long"]
+        # Parse FIND/REPLACE pairs
+        changes = self.parse_delta_response(response)
+        if not changes:
+            self.log("[yellow]Opus returned no parseable changes[/yellow]")
+            return article, ["no-parseable-changes"]
 
-        # Count what changed
-        import difflib
-        orig_lines = article.strip().split("\n")
-        edit_lines = edited.strip().split("\n")
-        diff = list(difflib.unified_diff(orig_lines, edit_lines, lineterm=""))
-        changes = sum(1 for d in diff if d.startswith("+") and not d.startswith("+++"))
+        # Apply changes
+        result = self.apply_delta_changes(article, changes)
 
-        issues_found = [f"Opus edited {changes} lines"]
-        self.log(f"Opus copy-edit: {changes} lines changed")
+        issues_found = [f"Opus applied {len(changes)} edits"]
+        self.log(f"Opus copy-edit: {len(changes)} edits applied")
 
-        return edited, issues_found
+        return result, issues_found
 
     def _count_long_paragraphs(self, article: str) -> int:
         """Count prose paragraphs over 42 words. Skips tables, bullet/numbered lists."""
