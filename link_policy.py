@@ -58,6 +58,7 @@ BLOCKED_DOMAINS = [
     "sirion.ai",
     "sirionlabs.com",
     "zefort.com",
+    "streamline.ai",
     "dealsign.ai",
     "salesforce.com",
     "agiloft.com",

@@ -414,7 +414,12 @@ class SEOPassAgent(BaseAgent):
 
     @staticmethod
     def _find_whole_word(phrase: str, text: str) -> int:
-        """Find phrase in text at word boundaries. Returns index or -1."""
+        """Find phrase in text at word boundaries. Returns index or -1.
+
+        Also rejects matches inside proper noun contexts like
+        'Journal of Contract Management' — wrapping 'Contract Management'
+        there would break the proper noun.
+        """
         start = 0
         while True:
             idx = text.find(phrase, start)
@@ -427,6 +432,11 @@ class SEOPassAgent(BaseAgent):
             # Check word boundary after
             end = idx + len(phrase)
             if end < len(text) and text[end].isalpha():
+                start = idx + 1
+                continue
+            # Reject if preceded by "of " (part of proper noun like "Journal of Contract Management")
+            before = text[max(0, idx - 4):idx].lower()
+            if before.endswith("of "):
                 start = idx + 1
                 continue
             return idx

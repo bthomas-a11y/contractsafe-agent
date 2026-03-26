@@ -50,6 +50,40 @@ class FinalValidatorAgent(BaseAgent):
         # Orphaned ". For" / ". That" / ". And" — continuation after removed stat
         article = re.sub(r'\n\. (?:For|That|And|But|This|So|It) [^\n]*\n', '\n\n', article)
 
+        # Remove duplicate stat lines (same numbers + attribution appearing twice)
+        seen_stat_lines = {}
+        dedup_lines = []
+        for line in article.split('\n'):
+            s = line.strip()
+            if s and not s.startswith('#'):
+                numbers = tuple(sorted(re.findall(r'\d+(?:\.\d+)?%', s)))
+                if numbers and any(p in s.lower() for p in ['according to', 'report', 'survey']):
+                    if numbers in seen_stat_lines:
+                        continue  # Skip duplicate stat line
+                    seen_stat_lines[numbers] = s
+            dedup_lines.append(line)
+        article = '\n'.join(dedup_lines)
+
+        # Close unclosed quotes at end of lines
+        fixed_quote_lines = []
+        for line in article.split('\n'):
+            s = line.strip()
+            if s and s.count('"') % 2 != 0 and not s.startswith('#'):
+                if s.endswith('.') or s.endswith('?') or s.endswith('!'):
+                    line = line.rstrip() [:-1] + '"' + line.rstrip()[-1]
+                else:
+                    line = line.rstrip() + '"'
+            fixed_quote_lines.append(line)
+        article = '\n'.join(fixed_quote_lines)
+
+        # Fix broken bold: close unmatched ** at end of line
+        fixed_bold_lines = []
+        for line in article.split('\n'):
+            if line.strip().count('**') % 2 != 0:
+                line = line.rstrip() + '**'
+            fixed_bold_lines.append(line)
+        article = '\n'.join(fixed_bold_lines)
+
         # Fix numbered list formatting: remove blank lines between step heading and body
         # Pattern: "1. **Heading**\n\nBody text" → "1. **Heading**\nBody text"
         article = re.sub(
@@ -57,6 +91,12 @@ class FinalValidatorAgent(BaseAgent):
             r'\1\n\2',
             article,
         )
+
+        # Fix garbled attributions: "according to According to" → "according to"
+        article = re.sub(r'according to According to', 'according to', article, flags=re.IGNORECASE)
+        # Fix orphaned "according to a recent." at end of sentences
+        article = re.sub(r',?\s*according to [Aa]ccording to [^.]*\.', '.', article)
+        article = re.sub(r',?\s*according to a recent\.', '.', article)
 
         # Collapse any resulting triple+ blank lines
         article = re.sub(r'\n{3,}', '\n\n', article)
@@ -603,7 +643,51 @@ class FinalValidatorAgent(BaseAgent):
         else:
             checks.append(("Definition Extractability", True, "No definition sections detected"))
 
-        # ── 31. Empty Numbered Steps ──
+        # ── 31. Duplicate Statistics ──
+        stat_fingerprints = []
+        for aline in article.split('\n'):
+            aline_s = aline.strip()
+            if not aline_s or aline_s.startswith('#'):
+                continue
+            numbers = re.findall(r'\d+(?:\.\d+)?%', aline_s)
+            if numbers and any(p in aline_s.lower() for p in ['according to', 'report', 'survey']):
+                fp = tuple(sorted(numbers))
+                stat_fingerprints.append(fp)
+        dup_stats = sum(1 for fp in set(stat_fingerprints) if stat_fingerprints.count(fp) > 1)
+        passed = dup_stats == 0
+        checks.append(("No Duplicate Statistics", passed,
+                       f"{dup_stats} stats appear more than once" if dup_stats else ""))
+        if not passed:
+            overall_pass = False
+
+        # ── 32. Unclosed Quotes ──
+        unclosed = 0
+        for aline in article.split('\n'):
+            s = aline.strip()
+            if not s or s.startswith('#') or s.startswith('|'):
+                continue
+            # Count straight double quotes
+            if s.count('"') % 2 != 0:
+                unclosed += 1
+        passed = unclosed == 0
+        checks.append(("No Unclosed Quotes", passed,
+                       f"{unclosed} lines with unclosed quotes" if unclosed else ""))
+        if not passed:
+            overall_pass = False
+
+        # ── 33. Broken Bold Formatting ──
+        broken_bold = 0
+        for aline in article.split('\n'):
+            s = aline.strip()
+            if s.count('**') % 2 != 0:
+                broken_bold += 1
+        passed = broken_bold == 0
+        checks.append(("No Broken Bold Formatting", passed,
+                       f"{broken_bold} lines with unmatched **" if broken_bold else ""))
+        if not passed:
+            overall_pass = False
+
+        # ── 34. Empty Numbered Steps ──
         empty_steps = 0
         article_lines = article.split('\n')
         for li, aline in enumerate(article_lines):

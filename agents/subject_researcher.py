@@ -361,10 +361,24 @@ class SubjectResearcherAgent(BaseAgent):
                         )
                         if topic_matches < 2:
                             continue
+                        # Generic market projections ("market worth $X billion")
+                        # need a higher relevance bar — they're industry-wide,
+                        # not about the specific topic
+                        if re.search(r'market.*(?:billion|million|worth|valued|reach)', stat_lower):
+                            if topic_matches < 4:
+                                continue
+
+                    # Extract org name from page title: "Stats 2025 - Procurement Tactics"
+                    # → "Procurement Tactics" (the part after the last separator)
+                    clean_name = source_name
+                    for sep in [" | ", " - ", " — ", " – "]:
+                        if sep in clean_name:
+                            clean_name = clean_name.split(sep)[-1].strip()
+                    clean_name = clean_name[:50]
 
                     stats.append({
                         "stat": stat_text,
-                        "source_name": source_name.split("|")[0].split("-")[0].strip()[:50],
+                        "source_name": clean_name,
                         "source_url": source_url,
                     })
 
@@ -396,6 +410,11 @@ class SubjectResearcherAgent(BaseAgent):
             matches = sum(1 for w in topic_words if w in lower)
             if matches < 3:
                 continue
+
+            # Skip generic market projections
+            if re.search(r'market.*(?:billion|million|worth|valued|reach)', lower):
+                if matches < 4:
+                    continue
 
             has_specifics = bool(re.search(
                 r'\d{4}|\d+%|\$[\d,]+|according to|report|survey|study|found that',

@@ -78,24 +78,30 @@ class FactCheckerAgent(BaseAgent):
         return state
 
     def _extract_claims(self, article: str) -> list[str]:
-        """Extract factual claims from the article text."""
+        """Extract factual claims from the article text.
+
+        Strip markdown links before extraction so claims can be matched
+        back to the article text during removal. Without this, a claim
+        containing '[text](url)' can't be found for removal.
+        """
         claims = []
         for line in article.split("\n"):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Lines with numbers, percentages, dollar amounts, or attribution phrases
+            # Strip markdown links to get plain text for matching
+            plain = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', line)
             has_stat = bool(re.search(
                 r'\d+%|\$[\d,]+|\d+\s*(billion|million|percent|times)',
-                line, re.IGNORECASE
+                plain, re.IGNORECASE
             ))
             has_attribution = any(
-                phrase in line.lower()
+                phrase in plain.lower()
                 for phrase in ["according to", "study found", "report found",
                                "research shows", "data shows", "survey"]
             )
             if has_stat or has_attribution:
-                claims.append(line[:300])
+                claims.append(plain[:300])
         return claims[:20]
 
     def _build_reference_corpus(self, state: PipelineState) -> list[str]:
@@ -119,13 +125,10 @@ class FactCheckerAgent(BaseAgent):
             else:
                 refs.append(str(fact).lower())
 
-        # Add subject research snippets
-        if state.subject_research:
-            # Extract sentences with numbers from research
-            for sentence in re.split(r'[.!?\n]', state.subject_research):
-                sentence = sentence.strip()
-                if any(c.isdigit() for c in sentence) and len(sentence) > 20:
-                    refs.append(sentence.lower())
+        # DO NOT add raw subject_research text — it contains unvetted search
+        # snippets that may include unverified stats. Only state.statistics and
+        # state.key_facts (which were extracted from pages Agent 2 actually read
+        # and filtered for topic relevance) should be trusted.
 
         # Filter empty strings
         return [r for r in refs if r.strip()]
@@ -153,7 +156,22 @@ class FactCheckerAgent(BaseAgent):
         has_stats = bool(numbers)
 
         # Extract key proper nouns / source names (capitalized words 4+ chars)
-        sources = re.findall(r'[A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,})*', claim)
+        # Filter out common English words that happen to be capitalized
+        _not_sources = {
+            "That", "This", "Here", "When", "Then", "Most", "Some", "They",
+            "There", "These", "Those", "Where", "What", "Which", "Every",
+            "Many", "Much", "Such", "Very", "Just", "Even", "Only", "Over",
+            "Under", "Before", "After", "Between", "Through", "About",
+            "Your", "Their", "Could", "Would", "Should", "Does", "Have",
+            "Been", "Were", "With", "From", "Into", "Also", "More",
+            "Bigger", "Larger", "Small", "Smaller", "Companies", "Research",
+            "According", "Meanwhile", "However", "Organizations", "Because",
+            "Nonprofits", "Nonprofit", "Contracts", "Software", "Market",
+            "Management", "Systems", "Platforms", "Tools", "Teams",
+            "Mismanaged", "Mismanagement", "Revenue", "Annual", "Average",
+        }
+        raw_sources = re.findall(r'[A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,})*', claim)
+        sources = [s for s in raw_sources if s not in _not_sources and len(s.split()) >= 2]
 
         # Stopwords to exclude from overlap calculations
         stopwords = {
@@ -274,9 +292,12 @@ class FactCheckerAgent(BaseAgent):
         if not re.search(r'\d+%|\$[\d,]+|\d+\s*(billion|million|percent|times)', claim, re.IGNORECASE):
             return article, False
 
-        # Find the claim in the article (it might be a partial line match)
+        # Find the claim in the article (it might be a partial line match).
+        # Claims are extracted as plain text (markdown links stripped),
+        # so we also need to search a plain-text version of the article.
         claim_trimmed = claim.strip()[:150]
-        if claim_trimmed not in article:
+        article_plain = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', article)
+        if claim_trimmed not in article and claim_trimmed not in article_plain:
             # Try matching just the stat portion
             stat_match = re.search(r'\d+(?:\.\d+)?%', claim)
             if not stat_match:
@@ -308,12 +329,13 @@ class FactCheckerAgent(BaseAgent):
                 return "\n".join(new_lines), True
             return article, False
 
-        # Direct match — remove the line
+        # Direct match — remove the line (also check plain-text version)
         lines = article.split("\n")
         new_lines = []
         removed = False
         for li, line in enumerate(lines):
-            if claim_trimmed in line:
+            line_plain = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', line)
+            if claim_trimmed in line or claim_trimmed in line_plain:
                 # Guard: don't remove if it's the sole body of a numbered step
                 if self._is_only_body_of_step(lines, li):
                     new_lines.append(line)
