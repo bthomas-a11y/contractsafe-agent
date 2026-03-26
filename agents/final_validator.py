@@ -924,6 +924,28 @@ class FinalValidatorAgent(BaseAgent):
 
         status = "PASS" if overall_pass else "FAIL"
         self.log(f"Validation result: {status} ({pass_count}/{total} checks passed)")
+
+        # ── VERIFICATION MANIFEST — actual content to eyeball, not scores ──
+        self.log("VERIFY — Title:")
+        h1_line = next((l for l in article.split('\n') if l.startswith('# ')), 'NO H1')
+        self.log(f"  {h1_line}")
+        self.log("VERIFY — Stats sourcing:")
+        for aline in article.split('\n'):
+            s = aline.strip()
+            if not s or s.startswith('#') or s.startswith('|'):
+                continue
+            if re.search(r'\d+%|\$[\d,]+|\d+\s*(?:billion|million)', s):
+                has_link = '](http' in s
+                has_source = any(p in s.lower() for p in ['according to', 'report', 'survey'])
+                status_tag = 'OK' if (has_link or has_source) else 'UNSOURCED'
+                self.log(f"  [{status_tag}] {s[:80]}")
+        self.log("VERIFY — First paragraph:")
+        for aline in article.split('\n'):
+            s = aline.strip()
+            if s and not s.startswith('#'):
+                self.log(f"  {s[:120]}")
+                break
+
         return state
 
     def _llm_copy_edit(self, article: str, state: PipelineState) -> tuple[str, list[str]]:
@@ -954,7 +976,9 @@ class FinalValidatorAgent(BaseAgent):
             "'The 7 Contract Types Every Nonprofit Forgets to Track' not "
             "'Best Nonprofit Contract Management Software'.\n"
             "- Lines that read like raw research data dumped into the article\n"
-            "- Tautologies ('Mismanagement can lead to financial losses' after saying the same thing)\n\n"
+            "- Tautologies ('Mismanagement can lead to financial losses' after saying the same thing)\n"
+            "- Vague attributions: 'according to industry research' or 'a recent survey found' "
+            "MUST be replaced with the specific source name if available, or removed if not\n\n"
             "Do NOT change: article structure, H2 headings, tables, markdown links, or add new content.\n\n"
             "Format each fix as:\n"
             "FIND: \"exact text from article\"\n"

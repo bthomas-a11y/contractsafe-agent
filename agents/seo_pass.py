@@ -38,7 +38,12 @@ class SEOPassAgent(BaseAgent):
         self.progress("Fixing keyword and heading issues...")
         article, fixed = self._apply_all_fixes(article, issues, state)
 
-        # ── Place links with Haiku (comprehension, not pattern matching) ──
+        # ── Link stat sentences to their research sources (runs ALWAYS, not just on link issues) ──
+        self.progress("Linking stats to research sources...")
+        article, stat_fixed = self._fix_stat_source_links(article, state)
+        fixed.extend(stat_fixed)
+
+        # ── Place remaining links with Haiku ──
         link_issues = [i for i in issues if "INTERNAL LINKS" in i or "EXTERNAL LINKS" in i]
         if link_issues:
             self.progress("Placing links with Haiku...")
@@ -61,8 +66,16 @@ class SEOPassAgent(BaseAgent):
                 self.log(f"  [yellow]- {issue[:100]}[/yellow]")
 
         state.seo_pass_article = article
-        state.seo_changes = fixed  # already list of dicts with change + detail
-        self.log(f"SEO pass complete. {len(fixed)} programmatic fixes. {len(remaining)} remaining (manual review).")
+        state.seo_changes = fixed
+
+        # ── VERIFICATION MANIFEST — show the actual content, not just counts ──
+        links = re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', article)
+        self.log(f"SEO pass complete. {len(fixed)} fixes. {len(remaining)} remaining.")
+        self.log(f"VERIFY — {len(links)} links in article:")
+        for anchor, url in links:
+            domain = url.split('/')[2] if len(url.split('/')) > 2 else url
+            self.log(f"  [{anchor[:40]}] -> {domain}")
+
         return state
 
     # ══════════════════════════════════════════════════════════════
@@ -702,7 +715,33 @@ class SEOPassAgent(BaseAgent):
 
         result_article = "\n".join(lines)
         added = len(fixed)
-        self.log(f"Sonnet placed {added} links from {len(placements)} suggestions")
+
+        # Quality check: remove links where anchor doesn't describe destination
+        all_links_after = re.findall(r'\[([^\]]+)\]\((https?://[^)]+)\)', result_article)
+        link_titles = {}
+        for l in (state.internal_links or []) + (state.external_links or []):
+            link_titles[l.get("url", "").lower().rstrip("/")] = l.get("title", "")
+
+        removed = 0
+        for anchor, url in all_links_after:
+            title = link_titles.get(url.lower().rstrip("/"), "")
+            if not title:
+                continue
+            # Check: do any meaningful words from the page title appear in the anchor?
+            trivial = {'the', 'a', 'an', 'of', 'for', 'and', 'to', 'in', 'your', 'how', 'best', 'is', 'are', 'with'}
+            title_words = set(title.lower().split()) - trivial
+            anchor_words = set(anchor.lower().split()) - trivial
+            overlap = title_words & anchor_words
+            if len(overlap) == 0 and len(anchor.split()) > 2:
+                # Anchor doesn't describe the destination — remove the link
+                result_article = result_article.replace(f"[{anchor}]({url})", anchor, 1)
+                removed += 1
+                self.progress(f"  Removed bad anchor: \"{anchor}\" (no overlap with page title)")
+
+        if removed:
+            self.log(f"Removed {removed} links with bad anchors")
+
+        self.log(f"Haiku placed {added - removed} links from {len(placements)} suggestions")
         return result_article, fixed
 
     def _dedup_existing_links(self, article: str) -> str:
