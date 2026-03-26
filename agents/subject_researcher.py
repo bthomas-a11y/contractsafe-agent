@@ -147,20 +147,23 @@ class SubjectResearcherAgent(BaseAgent):
         """Research a single keyword: search, fetch, read, extract facts."""
         self.progress(f"Researching: \"{keyword}\"")
 
-        # Build keyword-specific search query
-        # Strip generic modifiers to get the core topic
-        core = re.sub(
-            r'\b(best|software|tools?|platform|management|for|small|nonprofits?)\b',
+        # Build keyword-specific search queries.
+        # For buying-intent keywords ("template", "software"), also search
+        # for the underlying TOPIC — nobody publishes "template statistics"
+        # but they publish data about the problems templates address.
+        search_queries = [f"{keyword} statistics research report"]
+
+        # Strip buying-intent words to find the underlying topic
+        topic_kw = re.sub(
+            r'\b(template|software|tools?|free|best|top|platform|app|companies)\b',
             '', keyword, flags=re.IGNORECASE,
         ).strip()
-        core = re.sub(r'\s+', ' ', core).strip()
-        if len(core) < 4:
-            core = keyword  # Fallback to full keyword if core is too short
+        topic_kw = re.sub(r'\s+', ' ', topic_kw).strip()
 
-        search_queries = [
-            f"{keyword} statistics research report",
-            f"{core} nonprofit data survey",
-        ]
+        if topic_kw and topic_kw.lower() != keyword.lower() and len(topic_kw.split()) >= 2:
+            search_queries.append(f"{topic_kw} challenges data survey report")
+        else:
+            search_queries.append(f"{keyword} challenges best practices data")
 
         # Search
         results = []

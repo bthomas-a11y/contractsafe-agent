@@ -5,6 +5,7 @@ research data into an actionable brief.
 """
 
 import json
+import re
 from agents.base import BaseAgent
 from state import PipelineState
 
@@ -41,9 +42,8 @@ class BriefConsolidatorAgent(BaseAgent):
         sections.append("")
 
         # ── Recommended H2 Structure (scoped to word budget) ──
+        max_h2s = max(4, (state.target_word_count - 200) // 250) if state.target_word_count else 6
         if state.recommended_h2s:
-            # Budget: ~200 words for intro+conclusion, ~250 words per H2 section
-            max_h2s = max(4, (state.target_word_count - 200) // 250)
             h2s = state.recommended_h2s[:max_h2s]
             words_per_section = (state.target_word_count - 200) // len(h2s)
 
@@ -57,33 +57,92 @@ class BriefConsolidatorAgent(BaseAgent):
                 sections.append(f"\n*({skipped} lower-priority H2s omitted to fit word count)*")
             sections.append("")
 
-        # ── Key Facts & Statistics ──
-        if state.key_facts:
-            sections.append("## Key Facts to Include (SOURCED — do not add unsourced facts)")
-            for fact in state.key_facts:
-                if isinstance(fact, dict):
-                    f_text = fact.get("fact", fact.get("text", str(fact)))
-                    f_source = fact.get("source", "")
-                    sections.append(f"- {f_text}" + (f" (Source: {f_source})" if f_source else ""))
+        # ── Research Data Organized by H2 Section ──
+        # A blog writer organizes their research notes by section, not in one pile.
+        # Each H2 gets the facts, stats, and source URLs relevant to it.
+        sections.append("## Research for Each Section")
+        sections.append("**USE ONLY THESE STATS AND FACTS. DO NOT INVENT OTHERS.**")
+        sections.append("**When you use a stat, name the source in the text (e.g., 'according to World Commerce & Contracting').**\n")
+
+        h2s_for_brief = state.recommended_h2s[:max_h2s] if state.recommended_h2s else []
+        all_research = list(state.statistics or []) + list(state.key_facts or [])
+
+        if h2s_for_brief and all_research:
+            # Map each research item to its best-matching H2 by keyword tag + word overlap
+            h2_research = {h2: [] for h2 in h2s_for_brief}
+            unmatched = []
+
+            for item in all_research:
+                item_kw = item.get("keyword", "")
+                item_text = item.get("stat", item.get("fact", "")).lower()
+                is_stat = "stat" in item
+
+                best_h2 = None
+                best_score = 0
+                for h2 in h2s_for_brief:
+                    h2_lower = h2.lower()
+                    score = 0
+                    # Keyword tag matches H2 words
+                    if item_kw:
+                        kw_words = set(item_kw.lower().split())
+                        h2_words = set(re.findall(r'[a-z]+', h2_lower))
+                        score = len(kw_words & h2_words)
+                    # Item text matches H2 words
+                    h2_content_words = set(re.findall(r'[a-z]{4,}', h2_lower))
+                    text_overlap = sum(1 for w in h2_content_words if w in item_text)
+                    score += text_overlap
+                    if score > best_score:
+                        best_score = score
+                        best_h2 = h2
+
+                if best_h2 and best_score >= 2:
+                    h2_research[best_h2].append(item)
                 else:
-                    sections.append(f"- {fact}")
+                    unmatched.append(item)
+
+            for h2 in h2s_for_brief:
+                items = h2_research[h2]
+                sections.append(f"\n### For: {h2}")
+                if items:
+                    for item in items[:4]:
+                        if "stat" in item:
+                            s_text = item.get("stat", "")[:150]
+                            s_source = item.get("source_name", "")
+                            s_url = item.get("source_url", "")
+                            sections.append(f"- STAT: {s_text}")
+                            if s_source:
+                                sections.append(f"  Source name: {s_source}")
+                            if s_url:
+                                sections.append(f"  Source URL: {s_url}")
+                        else:
+                            f_text = item.get("fact", "")[:150]
+                            f_source = item.get("source", "")
+                            sections.append(f"- FACT: {f_text}")
+                            if f_source:
+                                sections.append(f"  Source: {f_source}")
+                else:
+                    sections.append("- (No specific research data for this section — write from general knowledge without inventing statistics)")
             sections.append("")
 
-        if state.statistics:
-            sections.append("## Statistics to Reference (USE ONLY THESE — DO NOT INVENT OTHERS)")
-            for stat in state.statistics:
-                if isinstance(stat, dict):
-                    s_text = stat.get("stat", stat.get("text", str(stat)))
-                    s_source = stat.get("source_name", stat.get("source", ""))
-                    s_url = stat.get("source_url", "")
-                    line = f"- {s_text}"
-                    if s_source:
-                        line += f" — {s_source}"
-                    if s_url:
-                        line += f" ({s_url})"
-                    sections.append(line)
+            if unmatched:
+                sections.append("### General research (use where appropriate)")
+                for item in unmatched[:5]:
+                    if "stat" in item:
+                        sections.append(f"- STAT: {item.get('stat', '')[:150]} — {item.get('source_name', '')} ({item.get('source_url', '')})")
+                    else:
+                        sections.append(f"- FACT: {item.get('fact', '')[:150]} (Source: {item.get('source', '')})")
+                sections.append("")
+        elif all_research:
+            # No H2s to map to — list all research generically
+            sections.append("### Available Research Data")
+            for item in all_research[:10]:
+                if "stat" in item:
+                    sections.append(f"- STAT: {item.get('stat', '')[:150]} — {item.get('source_name', '')} ({item.get('source_url', '')})")
                 else:
-                    sections.append(f"- {stat}")
+                    sections.append(f"- FACT: {item.get('fact', '')[:150]} (Source: {item.get('source', '')})")
+            sections.append("")
+        else:
+            sections.append("- No research data available. Write without statistics. DO NOT INVENT ANY.")
             sections.append("")
 
         # ── Keyword Cluster Strategy (from Agent 0) ──

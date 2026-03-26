@@ -64,6 +64,8 @@ class SEOPassAgent(BaseAgent):
         fixed = []
         self._global_modified_lines = set()  # Track lines modified across all link-insertion calls
         self._anchor_phrases = self._build_anchor_phrases(state)  # Cluster-informed phrases
+        self._phrase_use_count = {}  # Track how many times each phrase has been used as anchor
+        self._used_anchor_cores = set()  # Track root phrases for overlap detection
 
         # Count links before fixes for detail reporting
         internal_before = len(re.findall(r'\[.*?\]\(https?://(?:www\.)?contractsafe\.com[^)]*\)', article))
@@ -376,7 +378,39 @@ class SEOPassAgent(BaseAgent):
             "contracts", "agreements", "renewals",
         ]
 
-        return (cluster_phrases + base_phrases)[:30]
+        # Sort by specificity: longer phrases first
+        cluster_phrases.sort(key=lambda p: len(p), reverse=True)
+
+        # Remove substring overlaps — if "donor agreement" is in the list,
+        # "agreement" is redundant (it would produce the same generic anchor).
+        # Keep only the MOST specific version of each concept.
+        all_raw = cluster_phrases + base_phrases
+        deduped = []
+        for phrase in all_raw:
+            # Skip if this phrase is a substring of an already-kept phrase
+            is_subsumed = any(phrase in kept and phrase != kept for kept in deduped)
+            if not is_subsumed:
+                deduped.append(phrase)
+
+        return deduped[:30]
+
+    def _is_anchor_repetitive(self, phrase: str) -> bool:
+        """Check if this phrase overlaps with an already-used anchor.
+
+        'contract management software' is repetitive if 'contract management'
+        was already used. Forces genuinely different anchor text for each link.
+        """
+        if self._phrase_use_count.get(phrase, 0) >= 1:
+            return True
+        for used in self._used_anchor_cores:
+            if used in phrase or phrase in used:
+                return True
+        return False
+
+    def _record_anchor_used(self, phrase: str):
+        """Record that a phrase was used as anchor text."""
+        self._phrase_use_count[phrase] = self._phrase_use_count.get(phrase, 0) + 1
+        self._used_anchor_cores.add(phrase)
 
     @staticmethod
     def _find_whole_word(phrase: str, text: str) -> int:
@@ -514,13 +548,23 @@ class SEOPassAgent(BaseAgent):
                     line_words = set(stripped.lower().split())
                     overlap = anchor_words & line_words
                     if len(overlap) >= min_overlap and stripped.endswith("."):
-                        new_line = self._insert_link_naturally(stripped, anchor, url)
+                        # Prefer a cluster phrase as anchor for diversity
+                        effective_anchor = anchor
+                        low = stripped.lower()
+                        for cp in self._anchor_phrases:
+                            if self._is_anchor_repetitive(cp):
+                                continue
+                            if self._find_whole_word(cp, low) >= 0 and f"[{cp}" not in low:
+                                effective_anchor = cp
+                                break
+                        new_line = self._insert_link_naturally(stripped, effective_anchor, url)
                         if new_line is None:
                             continue  # would exceed 42 words
                         lines[i] = line.replace(stripped, new_line)
                         modified = True
                         added += 1
                         self._global_modified_lines.add(i)
+                        self._record_anchor_used(effective_anchor)
                         placed = True
                         break
 
@@ -558,6 +602,9 @@ class SEOPassAgent(BaseAgent):
                             continue
                         low = stripped.lower()
                         for phrase in all_internal_phrases:
+                            # Force anchor diversity: max 2 links per phrase
+                            if self._is_anchor_repetitive(phrase):
+                                continue
                             idx = self._find_whole_word(phrase, low)
                             if idx >= 0 and f"[{phrase}" not in low:
                                 before = stripped[:idx]
@@ -572,6 +619,7 @@ class SEOPassAgent(BaseAgent):
                                 modified = True
                                 current_internal += 1
                                 self._global_modified_lines.add(i)
+                                self._record_anchor_used(phrase)
                                 placed = True
                                 break
                         if placed:
@@ -609,6 +657,8 @@ class SEOPassAgent(BaseAgent):
                         all_phrases = self._anchor_phrases
                         placed = False
                         for phrase in all_phrases:
+                            if self._is_anchor_repetitive(phrase):
+                                continue
                             idx = self._find_whole_word(phrase, low)
                             if idx >= 0 and f"[{phrase}" not in low:
                                 # Don't wrap if already inside a link
@@ -624,6 +674,7 @@ class SEOPassAgent(BaseAgent):
                                 modified = True
                                 current_external += 1
                                 self._global_modified_lines.add(i)
+                                self._record_anchor_used(phrase)
                                 placed = True
                                 break
                         if placed:
