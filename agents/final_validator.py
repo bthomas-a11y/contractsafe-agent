@@ -101,7 +101,11 @@ class FinalValidatorAgent(BaseAgent):
         # Collapse any resulting triple+ blank lines
         article = re.sub(r'\n{3,}', '\n\n', article)
 
-        self.progress("Running 27-point quality checklist...")
+        # ── LLM copy-edit review — catch what regex can't ──
+        self.progress("Haiku copy-edit review (reading for gibberish, truncation, AI tells)...")
+        article, llm_issues = self._llm_copy_edit(article, state)
+
+        self.progress("Running quality checklist...")
 
         checks = []
         overall_pass = True
@@ -643,7 +647,15 @@ class FinalValidatorAgent(BaseAgent):
         else:
             checks.append(("Definition Extractability", True, "No definition sections detected"))
 
-        # ── 31. Duplicate Statistics ──
+        # ── 31. LLM Copy-Edit Review ──
+        gibberish_count = sum(1 for i in llm_issues if "[gibberish]" in i.lower() or "[broken]" in i.lower())
+        passed = gibberish_count == 0
+        checks.append(("Copy-Edit Review", passed,
+                       f"{len(llm_issues)} issues found ({gibberish_count} critical)" if llm_issues else "Clean"))
+        if not passed:
+            overall_pass = False
+
+        # ── 32. Duplicate Statistics ──
         stat_fingerprints = []
         for aline in article.split('\n'):
             aline_s = aline.strip()
@@ -873,6 +885,84 @@ class FinalValidatorAgent(BaseAgent):
         status = "PASS" if overall_pass else "FAIL"
         self.log(f"Validation result: {status} ({pass_count}/{total} checks passed)")
         return state
+
+    def _llm_copy_edit(self, article: str, state: PipelineState) -> tuple[str, list[str]]:
+        """Haiku reads the article like a copy editor — catching what regex can't.
+
+        Finds: gibberish, truncated sentences, garbled attributions, AI hallmark
+        phrases, keyword-stuffed titles, anything that sounds wrong.
+        Returns the article with fixes applied + list of issues found.
+        """
+        # Compact the article for Haiku — just the text, no tables
+        text_lines = []
+        for line in article.split("\n"):
+            stripped = line.strip()
+            if stripped and not stripped.startswith("|"):
+                text_lines.append(stripped)
+        compact = "\n".join(text_lines)
+
+        # If article is very long, truncate for Haiku
+        if len(compact) > 8000:
+            compact = compact[:8000] + "\n...[truncated]"
+
+        system_prompt = (
+            "You are a copy editor doing a final review of a blog article. "
+            "Find problems that automated checks miss. Output ONLY a JSON object.\n\n"
+            "Look for:\n"
+            "1. GIBBERISH: garbled text, truncated sentences ending mid-word, "
+            "concatenated words, double attributions ('according to X, according to Y')\n"
+            "2. AI TELLS: phrases like 'Here's the thing', 'Let's dive in', "
+            "'navigate the complexities', 'a different animal', 'the whole game'\n"
+            "3. TITLE: Is the H1 just a keyword stuffed into a title? A good title "
+            "is specific and compelling, not just the SEO keyword repeated.\n"
+            "4. BROKEN: sentences that don't make sense, references to content "
+            "that was removed, orphaned fragments\n\n"
+            "Output JSON: {\"issues\": [{\"type\": \"gibberish|ai_tell|title|broken\", "
+            "\"line\": \"the problematic text\", \"fix\": \"suggested replacement or 'remove'\"}]}\n"
+            "If no issues found, output: {\"issues\": []}"
+        )
+
+        user_prompt = f"ARTICLE:\n{compact}"
+
+        original_model = self.model
+        original_timeout = self.timeout
+        self.model = "haiku"
+        self.timeout = 90
+        try:
+            result = self.call_llm_json(system_prompt, user_prompt)
+        except Exception as e:
+            self.log(f"[yellow]LLM copy-edit failed: {e}. Continuing without.[/yellow]")
+            self.model = original_model
+            self.timeout = original_timeout
+            return article, []
+        finally:
+            self.model = original_model
+            self.timeout = original_timeout
+
+        issues_found = []
+        if isinstance(result, dict) and "issues" in result:
+            for issue in result["issues"]:
+                issue_type = issue.get("type", "")
+                line_text = issue.get("line", "")
+                fix = issue.get("fix", "")
+
+                issues_found.append(f"[{issue_type}] {line_text[:60]}")
+
+                if fix and fix.lower() != "remove" and line_text and line_text in article:
+                    article = article.replace(line_text, fix, 1)
+                    self.progress(f"  Fixed [{issue_type}]: {line_text[:50]} -> {fix[:50]}")
+                elif fix and fix.lower() == "remove" and line_text and line_text in article:
+                    article = article.replace(line_text, "", 1)
+                    self.progress(f"  Removed [{issue_type}]: {line_text[:60]}")
+                else:
+                    self.progress(f"  Flagged [{issue_type}]: {line_text[:60]}")
+
+        if issues_found:
+            self.log(f"Copy-edit found {len(issues_found)} issues")
+        else:
+            self.log("Copy-edit: no issues found")
+
+        return article, issues_found
 
     def _count_long_paragraphs(self, article: str) -> int:
         """Count prose paragraphs over 42 words. Skips tables, bullet/numbered lists."""

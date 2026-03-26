@@ -649,11 +649,69 @@ def apply_mechanical_fixes(article: str) -> str:
             expected += 1
     article = "\n".join(step_word_lines)
 
-    # ── 8. Collapse double blank lines ──
+    # ── 8. Remove AI hallmark phrases ──
+    # Known AI writing patterns that signal machine-generated content.
+    # These are removed or replaced to make the writing sound human.
+    _ai_hallmarks = [
+        # Filler openers — just delete (the sentence works without them)
+        (r"(?i)Here's the thing[.:]\s*", ""),
+        (r"(?i)Here's the thing about ([^.:]+)[.:]\s*", r"About \1: "),
+        (r"(?i)Here's the thing (\w+ )", r"\1"),  # "Here's the thing most" → "Most"
+        (r"(?i)Here's what (?:actually )?matters[.:]\s*", ""),
+        (r"(?i)And here's the (?:part|thing) (?:nobody|no one) talks about(?: enough)?[.:]\s*", ""),
+        (r"(?i)Let's (?:dive in|break it down|unpack this|take a closer look)[.:]\s*", ""),
+        (r"(?i)Let's be honest[.:]\s*", ""),
+        (r"(?i)It's worth noting that\s+", ""),
+        (r"(?i)It's important to (?:note|remember|understand) that\s+", ""),
+        (r"(?i)At the end of the day,\s*", ""),
+        (r"(?i)The bottom line is[.:]\s*", ""),
+        (r"(?i)In today's (?:landscape|world|environment|climate),?\s*", ""),
+        (r"(?i)In an era (?:where|of)\s+", ""),
+        (r"(?i)When it comes to\s+", "For "),
+        (r"(?i)The reality is(?:,| that)\s*", ""),
+        # "Spend less time X, more time Y" → just keep the benefit
+        (r"(?i)spend(?:s|ing)? less time (?:on |doing )?[^,]+(?:,| and) (?:more|spend(?:ing)?) (?:more )?time (?:on |doing )?", "focus on "),
+        # Hedging / AI caution phrases
+        (r"(?i)This (?:matters|is important) more (?:for [^.]+)?than you might think\.\s*", ""),
+        # "Navigate the complexities/challenges" — AI corporate
+        (r"(?i)navigate the (?:complexities|challenges|landscape) of\s+", "handle "),
+        # "Game-changer" / "robust" / "comprehensive" — AI vocabulary
+        (r"(?i)\bgame[- ]changer\b", "significant improvement"),
+        (r"(?i)\brobust\b", "strong"),
+        # More AI clichés
+        (r"(?i)\ba different animal\b", "different"),
+        (r"(?i)That's the whole game\.\s*", ""),
+        (r"(?i)That's the whole point\.\s*", ""),
+        (r"(?i)(?:And )?that's (?:exactly )?(?:where|why|how) things get interesting\.\s*", ""),
+        (r"(?i)Spoiler:\s*", ""),
+        (r"(?i)(?:And )?here's (?:the )?(?:kicker|catch|twist)[.:]\s*", ""),
+        (r"(?i)(?:But )?wait,? (?:it gets|there's) (?:better|worse|more)[.:]\s*", ""),
+        (r"(?i)Sound familiar\?\s*", ""),
+        (r"(?i)You already knew that\b", ""),
+        (r"(?i)If you're like most (?:organizations|teams|nonprofits|companies),?\s*", ""),
+    ]
+    for pattern, replacement in _ai_hallmarks:
+        article = re.sub(pattern, replacement, article)
+
+    # Capitalize the first letter after a deletion left a lowercase sentence start
+    article = re.sub(
+        r'(?<=\n)([a-z])',
+        lambda m: m.group(1).upper(),
+        article,
+    )
+
+    # Fix concatenated words ("mismanagementMismanagement" → "mismanagement. Mismanagement")
+    article = re.sub(
+        r'([a-z])([A-Z][a-z]{3,})',
+        lambda m: m.group(0) if any(brand in m.group(0) for brand in ['ContractSafe', 'JavaScript', 'LinkedIn', 'GitHub', 'NetSuite']) else f'{m.group(1)}. {m.group(2)}',
+        article,
+    )
+
+    # ── 9. Collapse double blank lines ──
     while '\n\n\n' in article:
         article = article.replace('\n\n\n', '\n\n')
 
-    # ── 9. Title-case H2 headings ──
+    # ── 10. Title-case H2 headings ──
     # e.g., "## main points for Contract Risk" → "## Main Points for Contract Risk"
     _tc_small = {'a', 'an', 'and', 'as', 'at', 'but', 'by', 'for', 'from',
                  'if', 'in', 'nor', 'of', 'on', 'or', 'so', 'the', 'to',
@@ -678,7 +736,7 @@ def apply_mechanical_fixes(article: str) -> str:
             h2_lines[hi] = "## " + " ".join(new_words)
     article = "\n".join(h2_lines)
 
-    # ── 10. Clean up whitespace ──
+    # ── 11. Clean up whitespace ──
     article = re.sub(r'  +', ' ', article)
     return article
 
